@@ -1,4 +1,4 @@
-"""Del-Fi daemon entry point (v0.2).
+"""Del-Fi daemon entry point.
 
 Usage:
   python main.py [--config PATH] [--simulator]
@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 
+from del_fi import __version__
 from del_fi.config import load_config
 from del_fi.core.dispatcher import Dispatcher
 from del_fi.core.facts import FactStore
@@ -24,7 +25,7 @@ from del_fi.core.peers import GossipDirectory, PeerCache
 from del_fi.core.router import Router
 from del_fi.mesh import create_interface
 
-VERSION = "0.2"
+VERSION = __version__
 
 log = logging.getLogger("del_fi")
 

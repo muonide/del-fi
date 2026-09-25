@@ -157,7 +157,7 @@ hr { border:none; border-top:1px solid var(--border); margin:12px 0; }
   <span id="hdr-node">—</span>
   <span id="hdr-model" style="color:var(--dim);font-size:11px;"></span>
   <span id="hdr-ollama" class="err">ollama: —</span>
-  <span style="color:var(--dim);font-size:11px;">v0.2</span>
+  <span id="hdr-version" style="color:var(--dim);font-size:11px;"></span>
 </header>
 
 <div class="layout">
@@ -460,6 +460,7 @@ async function loadDashboard() {
     gStatus = await api('/api/status');
     const s = gStatus;
     document.getElementById('hdr-node').textContent = s.node_name;
+    document.getElementById('hdr-version').textContent = 'v' + s.version;
     document.getElementById('hdr-model').textContent = s.model;
     const ho = document.getElementById('hdr-ollama');
     ho.textContent = 'ollama: ' + (s.ollama_ok ? '● ok' : '● down');

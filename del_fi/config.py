@@ -21,7 +21,7 @@ DEFAULTS: dict = {
     "personality": "You are a helpful and concise community assistant.",
     "fallback_message": "",              # empty: suggest known topics instead
     "knowledge_folder": "./knowledge",
-    # --- Wiki (v0.2) ---
+    # --- Wiki ---
     "wiki_folder": "./wiki",
     "wiki_builder_model": None,          # falls back to model if unset
     "wiki_rebuild_on_start": False,
