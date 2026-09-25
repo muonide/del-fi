@@ -97,12 +97,12 @@ personality: >
 
 **Weather station updates** (daily, via sensor feed):
 - The Tier 0 FactStore reads `cache/sensor_feed.json` directly — no wiki rebuild needed for live sensor data.
-- Update `weather-station.md` weekly with the 7-day log summary; `watch()` will `patch()` the wiki automatically.
+- Update `weather-station.md` weekly with the 7-day log summary; the wiki watcher recompiles its page automatically.
 
 **Camera log updates** (after each monthly SD card check):
 1. Append new entries to the top of `trail-camera-log.md`
-2. The `watch()` thread detects the change and calls `patch()` using the serving model
-3. For large batches (many new entries), run `--build-wiki` for a full re-synthesis
+2. The wiki watcher notices the change within a minute and recompiles that page with the serving model (or `wiki_patch_model`)
+3. For large batches (many new entries), run `--build-wiki` to recompile with the larger `wiki_builder_model`
 
 **Before deployment or after major updates**:
 ```bash

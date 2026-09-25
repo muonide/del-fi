@@ -53,7 +53,7 @@ Before serving, `--build-wiki` compiles your documents into a small **wiki**: on
 
 | Hardware | Speed | Power | Cost | Best For |
 |---|---|---|---|---|
-| Raspberry Pi 5 8GB | ~5 tok/s (3B) | ~10W | ~$80 | Budget field nodes — use `llama3.2:1b` |
+| Raspberry Pi 5 8GB | ~5 tok/s (3B) | ~10W | ~$80 | Budget field nodes — start with a 1B model |
 | Jetson Orin Nano Super | ~30 tok/s (3B) | ~15W | ~$249 | Solar field nodes |
 | Mac Mini M4 | ~18 tok/s (7B) | ~30W | ~$499 | Powered stations |
 
@@ -158,7 +158,7 @@ Responses up to 3 messages are delivered automatically. If the answer is longer 
 You:   Tell me about mountain lions in detail
 Node:  Mountain lion (Puma concolor) — apex predator
        at Ridgeline Station. Mostly nocturnal;
-       active dawn and dusk. // RIDGELINE
+       active dawn and dusk.
 Node:  Prey: elk calves, mule deer, snowshoe hare.
        Territory 80-200 sq mi. Tracks: 3" round,
        no claw marks (retractable).
@@ -168,7 +168,7 @@ Node:  Feb 15 sighting: adult, ~120 lbs, heading
 You:   !more
 Node:  Avoid corner situations on trail. Make noise.
        Do not run. If approached: stand tall, make
-       eye contact, back away slowly. // RIDGELINE
+       eye contact, back away slowly.
 ```
 
 ### Commands
@@ -317,12 +317,12 @@ What peering will never do:
 
 **"No wiki pages loaded"**
 - Run `python main.py --build-wiki` after adding documents
-- Files must be `.txt` or `.md` (PDF support coming later)
+- Files must be `.txt` or `.md`; convert PDFs to text first
 - Check the knowledge folder path in your config (relative paths are relative to the config file)
 - `python main.py --lint-wiki` reports orphaned pages, missing sources and stale pages
 
 **Slow responses**
-- 3B models are the sweet spot for constrained hardware
+- On a Pi, use a 1B model (`gemma3:1b` or `llama3.2:1b`); larger models answer better but much more slowly
 - Lower `max_context_tokens` — the model reads less, answers sooner
 - Large documents are fine: only their relevant sections are sent to the model
 
@@ -423,7 +423,6 @@ ExecStart=/home/pi/del-fi/venv/bin/python main.py --config /home/pi/del-fi/confi
 Restart=on-failure
 RestartSec=10
 
-# Keep thermals in check
 CPUQuota=80%
 MemoryMax=75%
 
@@ -447,11 +446,11 @@ Adjust `User`, `WorkingDirectory`, and paths if your clone or config is somewher
 If your Pi is running hot during inference:
 
 - **Use a smaller model** — `gemma3:1b` or `llama3.2:1b` instead of 4B+
-- **Raise `rate_limit_seconds`** to 30–60 to give the CPU thermal recovery time between queries
+- **Raise `rate_limit_seconds`** (default 30) to 60 or more to give the CPU recovery time between questions
 - **Lower `max_context_tokens`** (e.g. 512) and **`num_predict`** (e.g. 128) to reduce per-request compute
-- **Lower `memory_max_turns`** to 3–5 to keep prompts smaller
+- **Keep `memory_max_turns` low** (it's off by default) — each remembered turn makes the prompt longer
 - **Add a heatsink + fan** — the official Pi 5 active cooler makes a big difference
-- The `CPUQuota=80%` in the service file above prevents Del-Fi from fully saturating the CPU
+- **Cap inference, not Del-Fi** — the model runs in the `ollama` service, so `CPUQuota` in `delfi.service` doesn't limit it. Run `sudo systemctl edit ollama` and add `CPUQuota=300%` under `[Service]` to leave one of the Pi's four cores free
 
 ---
 

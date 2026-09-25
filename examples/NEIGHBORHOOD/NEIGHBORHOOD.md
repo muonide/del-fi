@@ -84,7 +84,7 @@ mesh_protocol: meshtastic
 
 **Routine updates** (e.g. new community-log entry, creek level change):
 1. Edit the source file in `knowledge/`
-2. The `wiki_watch_enabled` background thread detects the change and calls `patch()` automatically
+2. The wiki watcher (`wiki_watch_enabled`) notices the change within a minute and recompiles that page
 3. No manual rebuild needed for small appends
 
 **Before deployment or after significant knowledge changes**:
@@ -131,7 +131,7 @@ python main.py --config config.yaml
 ```
 
 ### First build time
-`--build-wiki` with `gemma4:12b` takes approximately 3–8 minutes per knowledge file on Raspberry Pi 5. With 6 files, expect 20–45 minutes total. Run this offline before deployment. Subsequent `patch()` updates via `watch()` use `gemma4:4b` and complete in under a minute.
+`--build-wiki` with `gemma4:12b` takes approximately 3–8 minutes per knowledge file on Raspberry Pi 5. With 6 files, expect 20–45 minutes total. Run this offline before deployment. After that, the watcher recompiles only the pages whose files change, using the serving model.
 
 ### Mesh positioning
 The library rooftop gives excellent line-of-sight to most of the neighborhood. The main coverage gap is the lower Greenway east of Sycamore (screened by the creek embankment). MILLBROOK-SENSOR covers part of this gap.

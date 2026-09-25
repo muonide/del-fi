@@ -12,7 +12,7 @@
 node_name: "MAPLEWOOD-ORACLE"
 
 # --- Model ---
-model: "gemma4:4b"   # Raspberry Pi 5: gemma4:4b. Constrained hardware: gemma4:2b
+model: "gemma4:4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 # wiki_builder_model: "gemma4:12b"   # bigger model for --build-wiki (falls back to model)
 # ollama_host: "http://localhost:11434"
 # ollama_timeout: 120                # seconds per answer
