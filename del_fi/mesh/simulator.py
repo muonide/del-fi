@@ -26,7 +26,6 @@ class SimulatorAdapter(MeshAdapter):
 
     def __init__(self, cfg: dict, msg_queue: queue.Queue):
         super().__init__(cfg, msg_queue)
-        self._rate_limits: dict[str, float] = {}
         self._connected = True
         self._should_run = True
         self._default_sender = "!sim00001"
@@ -39,9 +38,9 @@ class SimulatorAdapter(MeshAdapter):
     def _read_loop(self):
         node = self.cfg["node_name"]
         print(f"\n  Del-Fi Text Chat — {node} (simulator)")
-        print(f"  ─────────────────────────────────────────────")
-        print(f"  Type a message, or !nodeID> message to set sender")
-        print(f"  Commands start with ! (e.g. !help, !topics)\n")
+        print("  ─────────────────────────────────────────────")
+        print("  Type a message, or !nodeID> message to set sender")
+        print("  Commands start with ! (e.g. !help, !topics)\n")
 
         while self._should_run:
             try:
@@ -59,16 +58,8 @@ class SimulatorAdapter(MeshAdapter):
                 ts = time.strftime("%H:%M")
                 print(f"  \033[36m{sender}\033[0m \033[90m[{ts}]\033[0m {text}")
 
-                is_command = text.startswith("!")
-                if not is_command:
-                    now = time.time()
-                    last = self._rate_limits.get(sender, 0)
-                    if now - last < self.cfg["rate_limit_seconds"]:
-                        wait = int(self.cfg["rate_limit_seconds"] - (now - last))
-                        print(f"  \033[33m⏳ rate limited — wait {wait}s\033[0m")
-                        continue
-                    self._rate_limits[sender] = now
-
+                # Rate limiting happens in the Dispatcher, which replies
+                # with a notice like it would over the radio.
                 self.msg_queue.put((sender, text))
 
             except EOFError:
@@ -86,6 +77,12 @@ class SimulatorAdapter(MeshAdapter):
         ts = time.strftime("%H:%M")
         node = self.cfg["node_name"]
         print(f"  \033[32m{node}\033[0m \033[90m[{ts}] ➜ {dest_id}\033[0m {text}\n")
+        return True
+
+    def send_broadcast(self, text: str, channel_index: int = 0) -> bool:
+        ts = time.strftime("%H:%M")
+        node = self.cfg["node_name"]
+        print(f"  \033[35m{node}\033[0m \033[90m[{ts}] ➜ broadcast ch{channel_index}\033[0m {text}\n")
         return True
 
     @property

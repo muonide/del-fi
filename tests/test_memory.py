@@ -6,6 +6,7 @@ import time
 import unittest
 
 from del_fi.core.memory import ConversationMemory
+from tests._support import function_suite
 
 
 def _make_cfg(**overrides):
@@ -198,18 +199,12 @@ def test_hard_cap():
 
 
 # ---------------------------------------------------------------------------
-# unittest discovery wrapper — makes bare test_ functions discoverable
+# unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------
 
-_Tests = type(
-    "_Tests",
-    (unittest.TestCase,),
-    {
-        n: (lambda f: lambda self: f())(f)
-        for n, f in list(globals().items())
-        if n.startswith("test_") and callable(f)
-    },
-)
+
+def load_tests(loader, standard_tests, pattern):
+    return function_suite(globals(), standard_tests)
 
 if __name__ == "__main__":
     unittest.main()

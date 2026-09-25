@@ -2,46 +2,71 @@
 
 PeerCache (Tier 2)
 ------------------
-SQLite-backed cache of Q&A answers from trusted peer nodes.
-Answers are stored with TTL and matched by keyword overlap.
+SQLite-backed cache of Q&A answers from trusted peer nodes, matched by
+keyword overlap and always labelled with the peer's name. Trust is by
+hardware node ID (mesh_knowledge.peers[].node_id), never by display name.
+Nothing populates it yet: peer Q&A sync is on the roadmap.
 
 GossipDirectory (Tier 3)
--------------------------
-Lightweight directory of other Del-Fi nodes on the mesh, built from
-their broadcast announcements. Never caches answers; only provides
-referrals: "Try NODE — covers [topic]".
+------------------------
+Directory of other Del-Fi nodes heard on the mesh, built from their
+broadcast announcements. Never caches answers; only provides referrals:
+"Try VALLEY-ORACLE (!a1b2c3d4) — covers geology, mining".
+Opt-in via mesh_knowledge.gossip.enabled.
 
 Gossip announcement protocol
 ------------------------------
   DEL-FI:1:ANNOUNCE:<node_name>:topics=<t1,t2,...>:model=<model>
   Example:
-  DEL-FI:1:ANNOUNCE:VALLEY-ORACLE:topics=geology,mining,local-history:model=llama3.2
+  DEL-FI:1:ANNOUNCE:VALLEY-ORACLE:topics=geology,mining,local-history:model=llama3.2:3b
 
-The protocol version (1) allows future breaking changes without ambiguity.
+model= is always last and runs to the end of the message (model names
+contain colons). The protocol version (1) allows future breaking changes
+without ambiguity.
 """
 
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
+
+from del_fi.core.formatter import byte_len
+from del_fi.core.fsutil import write_atomic
+from del_fi.core.knowledge import index_slugs
+from del_fi.core.text import tokenize
 
 log = logging.getLogger("del_fi.core.peers")
 
 PROTOCOL_VERSION = 1
 ANNOUNCE_PREFIX = f"DEL-FI:{PROTOCOL_VERSION}:ANNOUNCE:"
-GOSSIP_TTL_SECONDS = 86400  # 24 hours
+GOSSIP_TTL_SECONDS = 86400  # default directory TTL (24 hours)
+DEFAULT_ANNOUNCE_INTERVAL = 14400
 JACCARD_THRESHOLD = 0.5
 MAX_CACHE_ENTRIES_DEFAULT = 500
 
-_STOP_WORDS = frozenset({
-    "a", "an", "the", "is", "it", "in", "on", "at", "to", "for",
-    "of", "and", "or", "not", "what", "where", "when", "how",
-    "who", "which", "that", "this", "there", "here", "with",
-    "from", "about", "i", "me", "my", "you", "your", "we", "our",
+MAX_DIRECTORY_NODES = 64
+MAX_TOPICS_PER_NODE = 12
+MAX_TOPIC_LEN = 32
+MAX_NAME_LEN = 32
+MAX_MODEL_LEN = 40
+# Re-save the directory when only last_seen moved, at most this often, so
+# entries survive a restart without an SD-card write per announcement.
+LAST_SEEN_SAVE_INTERVAL = 3600
+
+# Topic words too generic to justify a referral on their own.
+_GENERIC_TOPIC_WORDS = frozenset({
+    "guide", "guides", "log", "logs", "notes", "info", "overview", "area",
+    "local", "general", "misc", "faq", "index", "page", "pages",
 })
+
+
+def _gossip_cfg(cfg: dict) -> dict:
+    return (cfg.get("mesh_knowledge") or {}).get("gossip") or {}
 
 
 # ─────────────────────────── PeerCache ────────────────────────────────────
@@ -49,8 +74,8 @@ _STOP_WORDS = frozenset({
 class PeerCache:
     """Stores Q&A answers received from trusted peer nodes.
 
-    Thread-safe SQLite WAL database.  Trusted peers are configured via
-    the ``trusted_peers`` config key (list of node names).
+    Thread-safe SQLite WAL database. Trusted peers are the node IDs listed
+    in mesh_knowledge.peers.
     """
 
     CREATE_DDL = """
@@ -68,18 +93,26 @@ class PeerCache:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        mk = cfg.get("mesh_knowledge") or {}
+        sync = mk.get("sync") or {}
         self._trusted: set[str] = {
-            p.upper() for p in cfg.get("trusted_peers", [])
+            str(p["node_id"]).lower()
+            for p in mk.get("peers") or []
+            if isinstance(p, dict) and p.get("node_id")
         }
-        self._ttl: float = cfg.get("peer_cache_ttl", GOSSIP_TTL_SECONDS)
-        self._max_entries: int = cfg.get("max_cache_entries", MAX_CACHE_ENTRIES_DEFAULT)
+        self._ttl: float = float(sync.get("max_cache_age") or GOSSIP_TTL_SECONDS)
+        self._max_entries: int = int(sync.get("max_cache_entries") or MAX_CACHE_ENTRIES_DEFAULT)
         cache_dir = cfg.get("_cache_dir", ".")
         os.makedirs(cache_dir, exist_ok=True)
         self._db_path = os.path.join(cache_dir, "mesh-answers.db")
         self._lock = threading.Lock()
+        self._db: sqlite3.Connection | None = None
         self._init_db()
 
     # --- Public API ---
+
+    def is_trusted(self, peer_id: str) -> bool:
+        return str(peer_id).lower() in self._trusted
 
     def lookup(self, query: str) -> dict | None:
         """Return the best matching cached answer for *query*, or None.
@@ -89,14 +122,13 @@ class PeerCache:
         """
         if self._db is None:
             return None
-        query_tokens = _tokenize(query)
+        query_tokens = tokenize(query)
         if not query_tokens:
             return None
 
         now = time.time()
         with self._lock:
-            conn = self._conn()
-            rows = conn.execute(
+            rows = self._db.execute(
                 "SELECT peer_id, peer_name, query, response, timestamp "
                 "FROM peer_cache WHERE timestamp + ttl > ?",
                 (now,),
@@ -104,12 +136,11 @@ class PeerCache:
 
         best_score = 0.0
         best_row = None
-        for peer_id, peer_name, q, response, ts in rows:
-            row_tokens = _tokenize(q)
-            score = _jaccard(query_tokens, row_tokens)
+        for row in rows:
+            score = _jaccard(query_tokens, tokenize(row[2]))
             if score > best_score:
                 best_score = score
-                best_row = (peer_id, peer_name, q, response, ts)
+                best_row = row
 
         if best_score >= JACCARD_THRESHOLD and best_row is not None:
             peer_id, peer_name, q, response, ts = best_row
@@ -123,27 +154,25 @@ class PeerCache:
             }
         return None
 
-    def store(
-        self, query: str, answer: str, peer_id: str, peer_name: str
-    ):
-        """Cache an answer from a peer node. Only accepts trusted peers."""
+    def store(self, query: str, answer: str, peer_id: str, peer_name: str) -> bool:
+        """Cache an answer from a peer node. Only accepts trusted node IDs."""
         if self._db is None:
-            return
-        if not peer_id.upper() in self._trusted and not peer_name.upper() in self._trusted:
-            log.debug(f"ignoring answer from untrusted peer {peer_name!r}")
-            return
+            return False
+        if not self.is_trusted(peer_id):
+            log.debug(f"ignoring answer from untrusted peer {peer_id!r} ({peer_name!r})")
+            return False
 
         now = time.time()
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._db.execute(
                 "INSERT INTO peer_cache "
                 "(peer_id, peer_name, query, response, timestamp, ttl) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (peer_id, peer_name, query, answer, now, self._ttl),
             )
-            conn.commit()
+            self._db.commit()
         self.prune()
+        return True
 
     def prune(self):
         """Remove expired entries and enforce max_cache_entries."""
@@ -151,29 +180,24 @@ class PeerCache:
             return
         now = time.time()
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._db.execute(
                 "DELETE FROM peer_cache WHERE timestamp + ttl <= ?", (now,)
             )
-            count = conn.execute(
-                "SELECT COUNT(*) FROM peer_cache"
-            ).fetchone()[0]
+            count = self._db.execute("SELECT COUNT(*) FROM peer_cache").fetchone()[0]
             if count > self._max_entries:
-                excess = count - self._max_entries
-                conn.execute(
+                self._db.execute(
                     "DELETE FROM peer_cache WHERE id IN "
                     "(SELECT id FROM peer_cache ORDER BY timestamp ASC LIMIT ?)",
-                    (excess,),
+                    (count - self._max_entries,),
                 )
-            conn.commit()
+            self._db.commit()
 
     @property
     def entry_count(self) -> int:
         if self._db is None:
             return 0
         with self._lock:
-            conn = self._conn()
-            return conn.execute("SELECT COUNT(*) FROM peer_cache").fetchone()[0]
+            return self._db.execute("SELECT COUNT(*) FROM peer_cache").fetchone()[0]
 
     # --- Internal ---
 
@@ -183,14 +207,11 @@ class PeerCache:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(self.CREATE_DDL)
             conn.commit()
-            self._db: sqlite3.Connection | None = conn
+            self._db = conn
             log.info(f"peer cache ready at {self._db_path}")
         except Exception as e:
             log.error(f"could not init peer cache DB: {e} — peer cache disabled")
             self._db = None
-
-    def _conn(self) -> sqlite3.Connection:
-        return self._db  # type: ignore[return-value]  # callers guard against None
 
 
 # ─────────────────────────── GossipDirectory ──────────────────────────────
@@ -198,104 +219,137 @@ class PeerCache:
 class GossipDirectory:
     """Directory of other Del-Fi nodes on the mesh.
 
-    Built from broadcast announcements; entries expire after GOSSIP_TTL_SECONDS.
-    Never stores knowledge — only metadata about other nodes and their topics.
+    Built from announcements; entries are keyed by the sender's node ID and
+    expire after directory_ttl. Never stores knowledge — only metadata about
+    other nodes and their topics. Announcements are unauthenticated, so
+    everything in them is sanitised and the directory is size-capped.
     """
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        gossip = _gossip_cfg(cfg)
+        self.enabled: bool = bool(gossip.get("enabled", False))
+        self.announce_interval: float = float(
+            gossip.get("announce_interval") or DEFAULT_ANNOUNCE_INTERVAL
+        )
+        self.channel: int = int(gossip.get("channel") or 0)
+        self._ttl: float = float(gossip.get("directory_ttl") or GOSSIP_TTL_SECONDS)
         self._gossip_dir = cfg.get("_gossip_dir", "gossip")
         self._dir_file = os.path.join(self._gossip_dir, "node-directory.json")
-        self._nodes: dict[str, dict] = {}
+        self._nodes: dict[str, dict] = {}     # node_id -> entry
+        self._saved_at: dict[str, float] = {}  # node_id -> last_seen when last saved
         self._lock = threading.Lock()
         os.makedirs(self._gossip_dir, exist_ok=True)
-        self._load_disk()
+        if self.enabled:
+            self._load_disk()
 
     # --- Public API ---
 
-    def receive(self, node_id: str, announcement_text: str):
-        """Parse and store a node announcement from the mesh.
-
-        Announcement format:
-          DEL-FI:1:ANNOUNCE:<node_name>:topics=<t1,t2,...>:model=<model>
-        """
-        text = announcement_text.strip()
-        if not text.startswith(ANNOUNCE_PREFIX):
-            return
-
-        rest = text[len(ANNOUNCE_PREFIX):]
-        parts = rest.split(":")
-        if not parts:
-            return
-
-        node_name = parts[0].upper()
-        meta: dict = {"model": "unknown", "topics": []}
-        for part in parts[1:]:
-            if "=" not in part:
-                continue
-            k, _, v = part.partition("=")
-            k = k.strip()
-            if k == "topics":
-                meta["topics"] = [t.strip() for t in v.split(",") if t.strip()]
-            elif k == "model":
-                meta["model"] = v.strip()
-
-        entry = {
-            "node_id": node_id,
-            "node_name": node_name,
-            "topics": meta["topics"],
-            "model": meta["model"],
-            "last_seen": time.time(),
-        }
+    def receive(self, node_id: str, announcement_text: str) -> bool:
+        """Parse and store a node announcement. Returns True if stored."""
+        if not self.enabled:
+            return False
+        parsed = parse_announcement(announcement_text)
+        if parsed is None:
+            log.debug(f"gossip: unparseable announcement from {node_id}")
+            return False
+        node_name, topics, model = parsed
+        now = time.time()
 
         with self._lock:
-            self._nodes[node_name] = entry
+            old = self._nodes.get(node_id)
+            changed = (
+                old is None
+                or old.get("node_name") != node_name
+                or old.get("topics") != topics
+                or old.get("model") != model
+            )
+            self._nodes[node_id] = {
+                "node_id": node_id,
+                "node_name": node_name,
+                "topics": topics,
+                "model": model,
+                "last_seen": now,
+            }
+            if len(self._nodes) > MAX_DIRECTORY_NODES:
+                oldest = min(self._nodes, key=lambda k: self._nodes[k]["last_seen"])
+                del self._nodes[oldest]
+            due = now - self._saved_at.get(node_id, 0.0) > LAST_SEEN_SAVE_INTERVAL
 
-        self._save_disk()
-        log.info(
-            f"gossip: received announcement from {node_name} "
-            f"({len(meta['topics'])} topic(s))"
-        )
+        if changed or due:
+            self._save_disk()
+        if changed:
+            log.info(f"gossip: {node_name} ({node_id}) announces {len(topics)} topic(s)")
+        return True
 
     def referral(self, query: str) -> str | None:
         """Return a referral if another node covers the query topic.
 
-        Example: "Try VALLEY-ORACLE — covers geology, mining, local-history"
+        Example: "Try VALLEY-ORACLE (!a1b2c3d4) — covers geology, mining"
         """
-        self._expire()
-        query_tokens = _tokenize(query)
+        if not self.enabled:
+            return None
+        query_tokens = set(tokenize(query)) - _GENERIC_TOPIC_WORDS
         if not query_tokens:
             return None
 
-        with self._lock:
-            nodes = list(self._nodes.values())
-
         best_node = None
         best_overlap = 0
-
-        for node in nodes:
-            topic_tokens = set(
-                _tokenize(" ".join(node.get("topics", [])))
-            )
-            overlap = len(set(query_tokens) & topic_tokens)
+        for node in self.list_peers():
+            topic_tokens = set(tokenize(" ".join(node.get("topics", [])))) - _GENERIC_TOPIC_WORDS
+            overlap = len(query_tokens & topic_tokens)
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_node = node
 
-        if best_node and best_overlap > 0:
-            name = best_node["node_name"]
-            topics = ", ".join(best_node["topics"][:5])
-            return f"Try {name} — covers {topics}"
-
-        return None
+        if best_node is None:
+            return None
+        topics = ", ".join(best_node["topics"][:5])
+        return f"Try {best_node['node_name']} ({best_node['node_id']}) — covers {topics}"
 
     def announce(self) -> str:
-        """Build this node's announcement string for broadcast."""
-        name = self.cfg.get("node_name", "UNNAMED")
-        topics = self._local_topics()
-        model = self.cfg.get("model", "unknown")
-        topics_str = ",".join(topics)
-        return f"{ANNOUNCE_PREFIX}{name}:topics={topics_str}:model={model}"
+        """This node's announcement, trimmed to fit one message."""
+        name = _clean_name(self.cfg.get("node_name", "")) or "UNNAMED"
+        model = _clean_model(self.cfg.get("model", "")) or "unknown"
+        max_bytes = self.cfg.get("max_response_bytes", 230)
+        topics: list[str] = []
+        for topic in self.local_topics():
+            candidate = _format_announcement(name, topics + [topic], model)
+            if byte_len(candidate) > max_bytes:
+                break
+            topics.append(topic)
+        return _format_announcement(name, topics, model)
+
+    def local_topics(self) -> list[str]:
+        """This node's topics: wiki page slugs from wiki/index.md."""
+        try:
+            index = os.path.join(self.cfg.get("wiki_folder", "./wiki"), "index.md")
+            if os.path.exists(index):
+                with open(index, encoding="utf-8") as f:
+                    return _clean_topics(index_slugs(f.read()))
+        except OSError as e:
+            log.warning(f"could not read local topics: {e}")
+        return []
+
+    def announce_loop(self, send_broadcast: Callable[[str, int], bool], stop: threading.Event):
+        """Broadcast this node's announcement every announce_interval seconds.
+
+        The first one waits a random 1–5 minutes, and each interval is
+        jittered ±10%, so nodes that reboot together after a power cut do
+        not all transmit at once. Nodes with no wiki topics stay quiet.
+        """
+        if not self.enabled:
+            return
+        if stop.wait(random.uniform(60, 300)):
+            return
+        while True:
+            if self.local_topics():
+                if send_broadcast(self.announce(), self.channel):
+                    log.info("gossip: announcement sent")
+            else:
+                log.debug("gossip: no wiki topics yet — not announcing")
+            if stop.wait(self.announce_interval * random.uniform(0.9, 1.1)):
+                return
 
     def list_peers(self) -> list[dict]:
         """Return list of active (non-expired) peer entries."""
@@ -305,32 +359,16 @@ class GossipDirectory:
 
     @property
     def peer_count(self) -> int:
-        self._expire()
-        with self._lock:
-            return len(self._nodes)
+        return len(self.list_peers())
 
     # --- Internal ---
-
-    def _local_topics(self) -> list[str]:
-        """Infer local topics from wiki/index.md if available."""
-        try:
-            wiki_dir = self.cfg.get("wiki_folder", "./wiki")
-            index = os.path.join(wiki_dir, "index.md")
-            if os.path.exists(index):
-                with open(index, encoding="utf-8") as f:
-                    content = f.read()
-                slugs = re.findall(r"\[\[([^\]]+)\]\]", content)
-                return slugs[:10]
-        except Exception:
-            pass
-        return []
 
     def _expire(self):
         now = time.time()
         with self._lock:
             expired = [
                 k for k, v in self._nodes.items()
-                if now - v["last_seen"] > GOSSIP_TTL_SECONDS
+                if now - v["last_seen"] > self._ttl
             ]
             for k in expired:
                 del self._nodes[k]
@@ -339,33 +377,83 @@ class GossipDirectory:
 
     def _load_disk(self):
         try:
-            if os.path.exists(self._dir_file):
-                with open(self._dir_file) as f:
-                    data = json.load(f)
-                with self._lock:
-                    self._nodes = data
-                self._expire()
-                log.info(f"gossip directory loaded ({len(self._nodes)} node(s))")
+            if not os.path.exists(self._dir_file):
+                return
+            with open(self._dir_file) as f:
+                data = json.load(f)
+            nodes = {}
+            for node_id, entry in (data.items() if isinstance(data, dict) else []):
+                try:
+                    nodes[str(entry["node_id"])] = {
+                        "node_id": str(entry["node_id"]),
+                        "node_name": _clean_name(entry["node_name"]),
+                        "topics": _clean_topics(entry.get("topics", [])),
+                        "model": _clean_model(entry.get("model", "")),
+                        "last_seen": float(entry["last_seen"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue  # v0.2 name-keyed or malformed entry
+            with self._lock:
+                self._nodes = nodes
+                self._saved_at = {k: v["last_seen"] for k, v in nodes.items()}
+            self._expire()
+            log.info(f"gossip directory loaded ({len(self._nodes)} node(s))")
         except Exception as e:
             log.warning(f"could not load gossip directory: {e}")
 
     def _save_disk(self):
-        try:
-            with self._lock:
-                data = dict(self._nodes)
-            tmp = self._dir_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, self._dir_file)
-        except Exception as e:
-            log.warning(f"could not save gossip directory: {e}")
+        with self._lock:
+            data = dict(self._nodes)
+            self._saved_at = {k: v["last_seen"] for k, v in data.items()}
+        write_atomic(self._dir_file, json.dumps(data, indent=2))
 
 
 # ─────────────────────────── helpers ──────────────────────────────────────
 
-def _tokenize(text: str) -> list[str]:
-    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
-    return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
+
+def parse_announcement(text: str) -> tuple[str, list[str], str] | None:
+    """'DEL-FI:1:ANNOUNCE:NAME:topics=a,b:model=m:3b' -> (name, topics, model)."""
+    text = text.strip()
+    if not text.startswith(ANNOUNCE_PREFIX):
+        return None
+    name, _, fields = text[len(ANNOUNCE_PREFIX):].partition(":")
+    name = _clean_name(name)
+    if not name:
+        return None
+
+    model = ""
+    m = re.search(r"(?:^|:)model=(.*)\Z", fields, re.DOTALL)
+    if m:
+        model = m.group(1)
+        fields = fields[: m.start()]
+    topics: list[str] = []
+    t = re.search(r"(?:^|:)topics=([^:]*)", fields)
+    if t:
+        topics = t.group(1).split(",")
+    return name, _clean_topics(topics), _clean_model(model) or "unknown"
+
+
+def _format_announcement(name: str, topics: list[str], model: str) -> str:
+    return f"{ANNOUNCE_PREFIX}{name}:topics={','.join(topics)}:model={model}"
+
+
+def _clean_name(name) -> str:
+    return re.sub(r"[^A-Z0-9-]", "", str(name).upper())[:MAX_NAME_LEN]
+
+
+def _clean_topics(topics) -> list[str]:
+    cleaned: list[str] = []
+    for t in topics if isinstance(topics, list) else []:
+        slug = re.sub(r"[^a-z0-9-]+", "-", str(t).lower()).strip("-")[:MAX_TOPIC_LEN]
+        if slug and slug not in cleaned:
+            cleaned.append(slug)
+        if len(cleaned) >= MAX_TOPICS_PER_NODE:
+            break
+    return cleaned
+
+
+def _clean_model(model) -> str:
+    return "".join(ch for ch in str(model) if ch.isprintable() and not ch.isspace())[:MAX_MODEL_LEN]
 
 
 def _jaccard(a: list[str], b: list[str]) -> float:

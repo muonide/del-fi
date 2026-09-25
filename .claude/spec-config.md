@@ -1,262 +1,235 @@
 # Del-Fi — Configuration Specification
 
 <!-- Parent: .claude/claude.md §9 -->
+<!-- Source of truth: DEFAULTS / ORACLE_PROFILES / MESH_DEFAULTS in del_fi/config.py -->
 <!-- Related: config.example.yaml, all spec-*.md files (cross-reference config keys) -->
 
 ---
 
 ## 1. Config File Loading
 
-```python
-# config.py load order
-1. Load config.yaml from --config path (or default: ./config.yaml)
-2. Apply oracle profile (if model substring matches a profile — see §4)
-3. Validate required fields
-4. Resolve relative paths against config file directory
+```
+1. Path: --config PATH, else config.yaml next to main.py, else ~/del-fi/config.yaml
+2. Parse YAML (must be a mapping); node_name is required
+3. Warn (don't fail) about unknown top-level keys — usually typos
+4. Merge DEFAULTS; apply the oracle profile for the model (§4)
+5. Resolve paths against the config file's directory (§5)
+6. Build mesh_knowledge (defaults + v0.2 legacy keys, §2.10)
+7. Validate (§3)
 ```
 
-Config is read once at startup. Live reload is not supported.
-If config.yaml is missing, the daemon exits with an error (not a default).
+`read_config(path)` raises `ConfigError` with an operator-readable message;
+`load_config(path)` prints it (`[del-fi] Config error: …`) and exits 1 — the
+one place where crashing is correct. The GUI uses `read_config` so a bad
+edit is rejected without killing the server. Config is read once at startup;
+there is no live reload.
+
+The resolved path is recorded as `cfg["_config_path"]`; the GUI edits that
+file, never a guess.
 
 ---
 
-## 2. Full Key Reference
+## 2. Key Reference
 
-### 2.1 Core / Identity
+Every key is optional except `node_name`.
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `node_name` | str | — | **Yes** | Node identifier. `ALL-CAPS-HYPHENATED`. Appears in responses and announcements. |
-| `node_description` | str | `""` | No | One-sentence description used in gossip announcements and `!status`. |
-| `oracle_type` | str | `"general"` | No | Persona type: `observatory`, `community-hub`, `emergency`, `event`, `trade`, `lore`. Used in system prompt phrasing. |
-| `model` | str | — | **Yes** | Ollama model tag for query serving. e.g. `"gemma3:4b-it-qat"` |
-| `ollama_host` | str | `"http://localhost:11434"` | No | Ollama API endpoint. |
-| `fallback_message` | str | `"I don't have docs on that. Try !topics."` | No | Returned when all knowledge tiers miss. |
-| `error_message` | str | `"Error processing query."` | No | Returned on unhandled exception in query worker. |
-| `welcome_footer` | str | `""` | No | Appended to first-ever response to a new sender. Empty = disabled. |
+### 2.1 Identity
 
-### 2.2 Knowledge / Wiki
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `node_name` | str | — (**required**) | `ALL-CAPS-HYPHENATED`. Appears in replies and gossip. |
+| `personality` | str | "You are a helpful and concise community assistant." | Added to the system prompt. |
+| `fallback_message` | str | `""` | Reply when every tier misses. Empty = list known topics instead. |
+| `welcome_footer` | str | `""` | Footer on a sender's first single-message answer. Empty = "Del-Fi oracle · N pages · !help !topics". |
+| `oracle_type` | str | — | Shown in the GUI only. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `knowledge_folder` | str | `"./knowledge"` | No | Path to raw source documents. |
-| `wiki_folder` | str | `"./wiki"` | No | Path to compiled wiki output. |
-| `wiki_builder_model` | str | `""` | No | Ollama model tag for `--build-wiki`. Falls back to `model` if empty. |
-| `wiki_rebuild_on_start` | bool | `false` | No | Run `--build-wiki` automatically when daemon starts. Blocking. |
-| `wiki_stale_after_days` | int | `30` | No | Days before `--lint-wiki` flags a wiki page as stale. |
-| `time_sensitive_files` | list[str] | `[]` | No | Source filenames whose wiki pages get freshness headers in query context. |
-| `wiki_watch_enabled` | bool | `true` | No | Whether `watch()` background thread runs. Disable if knowledge/ files are static. |
-| `wiki_patch_model` | str | `""` | No | Ollama model tag for incremental `patch()` updates triggered by `watch()`. Defaults to `model` (serving model). Set to a slightly larger model if patch quality on the serving model is poor. |
-| `wiki_patch_threshold_pct` | int | `40` | No | If a changed source file has > this % of lines changed, `watch()` routes to `build()` (builder model) instead of `patch()` (patch model). Range: 1–100. |
+### 2.2 Model & Ollama
 
-### 2.3 Retrieval
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model` | str | `gemma4:4b` | Serving model (answers). Selects an oracle profile (§4). |
+| `ollama_host` | str | `http://localhost:11434` | |
+| `ollama_timeout` | number | `120` | Seconds per answer before giving up ("that took too long"). |
+| `num_predict` | int ≥ 16 | `300` | Max output tokens per answer. |
+| `num_ctx` | int ≥ 512 or empty | derived | Context window. Empty = derived from `max_context_tokens` and fixed for the process (see spec-knowledge §7.2). |
+| `embedding_model` | str | `nomic-embed-text` | For optional ChromaDB semantic search. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `similarity_threshold` | float | `0.28` | No | Minimum cosine similarity for ChromaDB results to be used. Range: 0.0–1.0. |
-| `rag_top_k` | int | `4` | No | Number of wiki pages to retrieve. |
-| `max_context_tokens` | int | `1024` | No | Max tokens of context passed to serving LLM. Oldest pages truncated first. |
-| `small_model_prompt` | bool | `false` | No | Use shorter system prompt variant (see spec-knowledge.md §7.3). |
-| `reorder_context` | bool | `false` | No | Put most-relevant context page last (improves small-model recall). |
-| `vectorstore_path` | str | `"./vectorstore"` | No | ChromaDB persistent directory. |
-| `embed_model` | str | `"nomic-embed-text"` | No | Ollama embedding model. |
+### 2.3 Knowledge / Wiki
 
-### 2.4 Mesh / Radio
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `knowledge_folder` | path | `./knowledge` | Raw source documents. |
+| `wiki_folder` | path | `./wiki` | Compiled wiki. |
+| `wiki_builder_model` | str | = `model` | Model for `--build-wiki` (can be much larger). |
+| `wiki_build_timeout` | number | `600` | Seconds per page for builds. |
+| `wiki_rebuild_on_start` | bool | `false` | Run a build at daemon startup (blocking). |
+| `wiki_watch_enabled` | bool | `true` | Background watcher: rebuild changed pages, prune deleted ones. |
+| `wiki_watch_interval_seconds` | int | `60` | Watcher poll interval. |
+| `wiki_patch_model` | str | = `model` | Model the watcher rebuilds with. Never defaults to `wiki_builder_model`. |
+| `wiki_stale_after_days` | int | `30` | `--lint-wiki` stale threshold. |
+| `time_sensitive_files` | list[str] | `[weather-station.md, trail-camera-log.md]` | Sources whose passages get a "last updated" header. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `mesh_type` | str | — | **Yes** | Adapter type. See spec-mesh.md for valid values. |
-| `serial_port` | str | `null` | No* | Serial port path. `null` = auto-detect. Required if `mesh_type: meshtastic-serial`. |
-| `tcp_host` | str | `null` | No* | TCP host. Required if `mesh_type: meshtastic-tcp`. |
-| `tcp_port` | int | `4403` | No | TCP port. |
-| `ble_address` | str | `null` | No | BLE device address. `null` = auto-scan. |
-| `max_response_bytes` | int | `230` | No | Hard byte limit for outbound messages. Never set above 230. |
-| `chunk_delay_seconds` | float | `3.0` | No | Delay between chunks of a multi-chunk response. Minimum: 1.0. |
-| `auto_send_chunks` | int | `3` | No | Chunks auto-sent before requiring `!more`. |
-| `append_node_suffix` | bool | `false` | No | Append `// NODE_NAME` to all responses. |
-| `node_suffix_format` | str | `"// {node_name}"` | No | Suffix template. `{node_name}` is substituted. |
+### 2.4 Retrieval
 
-### 2.5 Rate Limiting
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_context_tokens` | int ≥ 64 or empty | 1500 (profiles: 512 / 3000) | Budget for retrieved passages. |
+| `similarity_threshold` | float | `0.28` | Min cosine similarity for semantic page matches. |
+| `rag_top_k` | int | `4` | Semantic search result count. |
+| `small_model_prompt` | bool | `false` | Shorter system prompt (1B/2B profiles). |
+| `reorder_context` | bool | `false` | Most relevant page last (1B/2B profiles). |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `rate_limit_seconds` | int | `30` | No | Per-sender query rate limit in seconds. 0 = disabled. Commands always bypass. |
-| `query_queue_size` | int | `20` | No | Max items in the query worker queue before dropping oldest. |
+### 2.5 Mesh / Radio
 
-### 2.6 Conversation Memory
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mesh_protocol` | `meshtastic` \| `meshcore` | `meshtastic` | MeshCore is a stub. |
+| `radio_connection` | `serial` \| `tcp` \| `ble` | `serial` | Meshtastic transport. |
+| `radio_port` | str | `/dev/ttyUSB0` | Serial device, `host[:port]`, `[ipv6]:port`, or BLE address. |
+| `want_ack` | bool | `true` | Send DMs with wantAck (firmware retries across hops). |
+| `max_response_bytes` | int 50–256 | `230` | Hard per-message limit. Keep 230 unless you know your firmware's payload limit. |
+| `auto_send_chunks` | int ≥ 1 | `3` | Chunks sent before requiring `!more`. |
+| `meshcore` | mapping | `{port, connection, baud_rate}` | MeshCore stub settings. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `memory_max_turns` | int | `3` | No | Max (user, assistant) pairs remembered per sender. |
-| `memory_ttl` | int | `1800` | No | Seconds before idle conversation expires. |
-| `memory_persist_path` | str | `conversation_memory.json` | No | Disk path for memory persistence. |
-| `disable_memory` | bool | `false` | No | Disable conversation history entirely. |
+### 2.6 Dispatcher: rate limit & queue
 
-### 2.7 Message Board
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `rate_limit_seconds` | number ≥ 0 | `30` | One question per sender per window (`!retry` counts). 0 = off. |
+| `rate_limit_notice` | bool | `true` | Reply once per window to a rate-limited sender. |
+| `query_queue_size` | int ≥ 1 | `10` | Max questions waiting for the LLM; extra ones get a "too many queued" reply. |
+| `busy_notice` | bool | `true` | Tell queued senders they're in line. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `board_enabled` | bool | `true` | No | Enable/disable board commands. |
-| `board_max_posts` | int | `20` | No | Max posts stored (FIFO). |
-| `board_rate_limit` | int | `3` | No | Max posts per sender per `board_rate_window`. |
-| `board_rate_window` | int | `3600` | No | Rate limit window in seconds. |
-| `board_post_max_chars` | int | `200` | No | Max characters per post. |
-| `board_persist_path` | str | `board.json` | No | Disk path for board persistence. |
-| `board_in_llm_context` | bool | `true` | No | Inject board content into LLM query context (with prompt-sandwich framing). |
+### 2.7 Response cache
 
-### 2.8 FactStore / Sensors
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `response_cache_ttl` | number ≥ 0 | `300` | Seconds a cached answer is reused (history-free questions only). |
+| `persistent_cache` | bool | `true` | Persist to `cache/response_cache.json` (flushed every 60 s). |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `sensor_feed_path` | str | `cache/sensor_feed.json` | No | Path to sensor feed JSON. |
-| `fact_query_keywords` | dict | `{}` | No | Maps query keyword → list of fact keys. |
-| `fact_poll_interval` | int | `30` | No | Seconds between sensor_feed.json re-reads. |
+### 2.8 Conversation memory
 
-### 2.9 Peer / Gossip
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory_max_turns` | int ≥ 0 | `0` | Turns remembered per sender. 0 = off. Capped at 50. |
+| `memory_ttl` | int | `3600` | Seconds of inactivity before a conversation is forgotten. |
+| `persistent_memory` | bool | `false` | Persist to `cache/conversation_memory.json`. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `trusted_peers` | list[str] | `[]` | No | Hardware node IDs of trusted peers. Only these contribute to Tier 2 cache. |
-| `gossip_interval_seconds` | int | `14400` | No | How often to broadcast capability announcement. |
-| `gossip_ttl_seconds` | int | `86400` | No | TTL for received gossip directory entries. |
-| `peer_sync_enabled` | bool | `false` | No | Enable nightly peer Q&A sync. |
-| `peer_sync_hour` | int | `2` | No | Local hour (0–23) for peer sync window start. |
+### 2.9 Board
 
-### 2.10 Response Cache
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `board_enabled` | bool | `false` | `!board`, `!post`, `!unpost`. |
+| `board_max_posts` | int | `50` | Capped at 500. |
+| `board_post_ttl` | int | `86400` | Seconds a post lives. |
+| `board_show_count` | int | `5` | Posts per `!board` (split with `!more`). |
+| `board_persist` | bool | `true` | Persist to `cache/board.json`. |
+| `board_rate_limit` / `board_rate_window` | int / int | `3` / `3600` | Posts per sender per window. |
+| `board_blocked_patterns` | list[regex] | `[]` | Extra patterns rejected on post. |
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `cache_ttl_seconds` | int | `300` | No | TTL for cached query responses. |
-| `cache_persist_path` | str | `cache/response_cache.json` | No | Disk path for cache persistence. |
-| `more_buffer_ttl_seconds` | int | `600` | No | TTL for `!more` chunk buffers. |
+### 2.10 Peers & gossip (`mesh_knowledge`)
 
-### 2.11 Logging
+```yaml
+mesh_knowledge:
+  gossip:
+    enabled: false          # announce + listen; also gates Tier 3 referrals
+    announce_interval: 4h   # seconds or 30s/15m/4h/7d; minimum 15m
+    directory_ttl: 24h
+    channel: 0              # 0-7
+  peers:                    # trusted for Tier 2, by hardware node ID only
+    - node_id: "!a1b2c3d4"
+      name: "MARINA-ORACLE"
+  sync:                     # Tier 2 Q&A sync — reserved, not implemented
+    max_cache_age: 7d
+    max_cache_entries: 500
+```
 
-| Key | Type | Default | Required | Description |
-|-----|------|---------|----------|-------------|
-| `log_level` | str | `"INFO"` | No | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
-| `log_file` | str | `null` | No | Path to log file. `null` = stderr only. |
+v0.2 top-level keys are still read, with a deprecation warning:
+`trusted_peers` (node IDs kept, names dropped), `peer_cache_ttl` →
+`sync.max_cache_age`, `max_cache_entries` → `sync.max_cache_entries`,
+`gossip_announce_interval` → `gossip.announce_interval`.
+
+### 2.11 Sensors (FactStore)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `fact_feed_file` | path | `cache/sensor_feed.json` | Sensor feed (schema: spec-memory.md §3). |
+| `fact_watch_interval_seconds` | int | `30` | Feed poll interval. |
+| `fact_query_keywords` | list[str] | weather / camera words | Whole-word gate for Tier 0. |
+
+### 2.12 Logging
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_level` | `debug` \| `info` \| `warning` \| `error` \| `critical` | `info` | |
+| `log_file` | path | `""` | Also log to this file (rotated at 1 MB × 3). The simulator logs to `del_fi.log` next to the config when unset. |
 
 ---
 
 ## 3. Validation Rules
 
-The config loader validates on startup and raises `ConfigError` (not a silent
-default) for constraint violations.
+Violations raise `ConfigError` (exit 1 from the CLI):
 
-| Rule | Error |
-|------|-------|
-| `node_name` empty or missing | `"node_name is required"` |
-| `model` empty or missing | `"model is required"` |
-| `mesh_type` not in `MESH_ADAPTERS` | `"unknown mesh_type: {value}"` |
-| `similarity_threshold` not in `[0.0, 1.0]` | `"similarity_threshold must be 0.0–1.0"` |
-| `max_response_bytes` > 230 | `"max_response_bytes cannot exceed 230"` |
-| `max_response_bytes` < 50 | `"max_response_bytes must be ≥ 50"` |
-| `chunk_delay_seconds` < 1.0 | `"chunk_delay_seconds minimum is 1.0"` |
-| `memory_max_turns` < 1 | `"memory_max_turns must be ≥ 1"` |
-| `peer_sync_hour` not in `[0, 23]` | `"peer_sync_hour must be 0–23"` |
+| Rule | Message mentions |
+|------|------------------|
+| file missing / not YAML / not a mapping | the path |
+| `node_name` missing or empty | `node_name` |
+| `model` not a non-empty string | `model` |
+| `mesh_protocol` not supported | supported protocols |
+| `radio_connection` not serial/tcp/ble | `radio_connection` |
+| `max_response_bytes` not an int 50–256 | the LoRa limit |
+| `rate_limit_seconds`, `response_cache_ttl` negative or non-numeric | the key |
+| `auto_send_chunks` < 1, `num_predict` < 16, `num_ctx` < 512, `max_context_tokens` < 64, `memory_max_turns` < 0 | the key |
+| `query_queue_size` < 1, `ollama_timeout` ≤ 0 | the key |
+| `log_level` unknown | valid levels |
+| `mesh_knowledge.gossip.announce_interval` < 15 min, bad `directory_ttl`, `channel` not 0–7 | the key |
+| a `mesh_knowledge.peers` entry without a `!xxxxxxxx` node ID | node IDs, not names |
+| bad `sync.max_cache_age` / `max_cache_entries` | the key |
 
-Unknown config keys generate a `log.warning` but do not cause a startup failure.
-This allows forward-compatibility when a new config key is documented before the
-code is deployed.
+Unknown top-level keys are logged as a warning, not an error.
 
 ---
 
 ## 4. Oracle Profiles
 
-Oracle profiles auto-tune retrieval parameters based on the `model` config value.
-They are applied **after** user config is loaded, overriding only the listed keys.
-Explicit user config values always win (profiles only provide defaults).
+Per-model defaults, applied by case-insensitive substring match on `model`
+(first match wins). Keys set explicitly in config.yaml always win.
 
-### Profile application logic
+| Profile | Overrides |
+|---------|-----------|
+| `gemma4:2b`, `gemma3:1b`, `llama3.2:1b` | `similarity_threshold: 0.35`, `rag_top_k: 2`, `max_context_tokens: 512`, `small_model_prompt: true`, `reorder_context: true` |
+| `gemma4:4b`, `gemma3:4b`, `qwen2.5:3b` | `similarity_threshold: 0.28`, `rag_top_k: 4` |
+| `gemma4:12b` | `similarity_threshold: 0.25`, `rag_top_k: 5`, `max_context_tokens: 3000` |
+| anything else | config values as-is |
 
-```python
-def _apply_oracle_profile(config: dict) -> dict:
-    model = config.get("model", "").lower()
-    for pattern, overrides in ORACLE_PROFILES.items():
-        if pattern in model:
-            for key, value in overrides.items():
-                if key not in USER_SET_KEYS:  # don't override explicit user values
-                    config[key] = value
-            log.info("Applied oracle profile: %s", pattern)
-            break
-    return config
-```
-
-### Defined profiles
-
-```python
-ORACLE_PROFILES = {
-    # Sub-2B models: tight context budget, simpler prompt, fewer chunks
-    "gemma3:1b": {
-        "similarity_threshold": 0.35,
-        "rag_top_k": 2,
-        "max_context_tokens": 512,
-        "small_model_prompt": True,
-        "reorder_context": True,
-    },
-    "llama3.2:1b": {
-        "similarity_threshold": 0.35,
-        "rag_top_k": 2,
-        "max_context_tokens": 512,
-        "small_model_prompt": True,
-        "reorder_context": True,
-    },
-    # Mid-range 3–4B models: standard config
-    "gemma3:4b": {
-        "similarity_threshold": 0.28,
-        "rag_top_k": 4,
-    },
-    "qwen2.5:3b": {
-        "similarity_threshold": 0.28,
-        "rag_top_k": 4,
-    },
-    # 7B+ models: no profile; use config values as-is
-}
-```
-
-Profile matching is substring: `"gemma3:1b"` matches `"gemma3:1b-it-qat"`.
-Only the first matching profile is applied. More specific patterns should be
-listed before less specific ones.
+`gemma3:1b` matches `gemma3:1b-it-qat`; it does not match `gemma3:12b`.
 
 ---
 
 ## 5. Path Resolution
 
-All path config values (e.g. `knowledge_folder`, `wiki_folder`, `sensor_feed_path`)
-are resolved relative to the **directory containing config.yaml**, not the current
-working directory.
+`knowledge_folder`, `wiki_folder` and `log_file` are resolved relative to the
+**directory containing config.yaml** (after `~` expansion), not the working
+directory. Runtime state always lives next to the config:
 
-```python
-config_dir = os.path.dirname(os.path.abspath(config_path))
-config["knowledge_folder"] = os.path.join(config_dir, config["knowledge_folder"])
-```
+| Derived key | Path |
+|-------------|------|
+| `_config_path` | the config file itself |
+| `_cache_dir` | `cache/` (response cache, board, memory, facts, peer DB) |
+| `_gossip_dir` | `gossip/` |
+| `_vectorstore_dir` | `vectorstore/` |
+| `_seen_senders_file` | `seen_senders.txt` |
 
-This ensures `python main.py --config /etc/del-fi/config.yaml` works correctly
-regardless of where the daemon is started from.
+So `python main.py --config /etc/del-fi/config.yaml` works from anywhere.
 
 ---
 
 ## 6. config.example.yaml
 
-The canonical portable template committed to git. It must always reflect all
-current config keys with sensible defaults and inline comments.
-
-Sections in order:
-1. Identity: `node_name`, `node_description`, `oracle_type`
-2. LLM: `model`, `ollama_host`, `fallback_message`
-3. Knowledge / Wiki: `knowledge_folder`, `wiki_folder`, `wiki_builder_model`, `wiki_rebuild_on_start`, `wiki_stale_after_days`
-4. Retrieval: `similarity_threshold`, `rag_top_k`, `max_context_tokens`
-5. Mesh: `mesh_type`, `serial_port`, `max_response_bytes`, `chunk_delay_seconds`
-6. Rate limiting: `rate_limit_seconds`, `query_queue_size`
-7. Memory: `memory_max_turns`, `memory_ttl`
-8. Board: `board_enabled`, `board_max_posts`, `board_rate_limit`
-9. Sensors: `sensor_feed_path`, `fact_query_keywords`
-10. Gossip / peers: `trusted_peers`, `gossip_interval_seconds`
-11. Logging: `log_level`, `log_file`
-
-All values in `config.example.yaml` must be valid defaults. Do not include
-deployment-specific values (node names, serial ports, peer IDs).
+The committed template. It must list every key a typical operator changes,
+with defaults shown and short comments, and contain nothing deployment-
+specific beyond the example node name. When a key is added to `DEFAULTS`,
+add it here, to §2, and — if the GUI should edit it — to the GUI form.
 
 ---
 

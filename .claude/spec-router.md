@@ -149,133 +149,123 @@ Returns: `"{node_name} online"`
 
 ## 3. Response Cache
 
-The response cache stores exact-match query → response pairs. It avoids repeated
-LLM inference for identical questions.
+Stores question → answer pairs so a repeated question skips the LLM.
 
 ### 3.1 Cache key
 
 ```python
-cache_key = query_text.strip().lower()
+cache_key = " ".join(query.lower().split()).strip(" ?!.,;:")
 ```
 
-No fuzzy matching. Only exact-match after normalisation.
+Case, whitespace and trailing punctuation are normalised. No fuzzy matching.
 
-### 3.2 Cache storage
+### 3.2 When the cache is used
 
-In-memory dict + disk persistence (JSON file at `cache/response_cache.json`).
-Loaded from disk on startup. Flushed to disk by background thread every
-60 seconds and on clean shutdown.
+- Only for questions asked **without conversation history**. When memory is
+  enabled and the sender has history, the answer depends on that history, so
+  it is neither read from nor written to the shared cache — otherwise one
+  sender's conversation could be served to another.
+- Tier 0 (facts) bypasses the cache: freshness is the point.
+- Populated with Tier 1 and Tier 2 answers. Fallbacks, referrals and error
+  replies are never cached.
+- `!retry` evicts the sender's last question before re-running it.
+- Commands neither read nor populate the cache.
 
-### 3.3 Cache entry format
+### 3.3 Storage
 
-```python
-{
-    "query_lower": {
-        "response": "Answer text...",
-        "timestamp": 1714000000.0,   # Unix timestamp
-        "sender": "!a1b2c3d4",       # last sender (informational, for log)
-    }
-}
+In memory, capped at 100 entries (expired entries dropped first, then the
+oldest). Persisted to `cache/response_cache.json` every 60 s when dirty and on
+shutdown, via an atomic write:
+
+```json
+{"where is the trailhead": {"response": "…", "provenance": null, "ts": 1714000000.0}}
 ```
+
+`provenance` holds the peer name for Tier 2 answers, so a cached peer answer
+is still labelled `[via PEER]` when served again.
 
 ### 3.4 TTL
 
-Config key: `cache_ttl_seconds` (default: 300).
-
-On cache lookup:
-
-```python
-if time.time() - entry["timestamp"] > self._cache_ttl:
-    del self._cache[cache_key]
-    return None
-```
-
-### 3.5 Cache bypass
-
-- `!retry` command: bypasses cache and re-runs the LLM query.
-- Cache is populated at the end of every successful query-worker run.
-- Commands do not use or populate the response cache.
+Config key: `response_cache_ttl` (default: 300 seconds).
 
 ---
 
 ## 4. `!more` Buffer
 
-Stores the last full (untruncated) response per sender so follow-up chunks can
-be retrieved.
+### 4.1 Lifecycle
 
-### 4.1 Data structure
+1. An answer or command output longer than one message is split into chunks
+   (`format_response()` for answers; line-aware `paginate()` for command
+   output, so board posts and sensor lines are not cut mid-line) and stored
+   as the sender's buffer.
+2. The first `auto_send_chunks` (default 3) chunks are sent immediately. If
+   more remain, the last auto-sent chunk ends with ` [!more]`.
+3. Extra chunks are only ever auto-sent from a buffer created by the current
+   message — never from an older answer still in the buffer.
+4. A new **answer** always replaces or clears the sender's buffer. Short
+   **command** output leaves it alone, so `!status` between two `!more`s does
+   not lose the pending answer; long command output replaces it.
+5. `!more` → exactly one next chunk. `!more N` → re-send chunk N (1-indexed),
+   for chunks lost on a lossy mesh.
+6. Buffers expire 10 minutes after the last `!more`.
 
-```python
-# per sender: {"full_text": str, "chunks": list[str], "timestamp": float}
-_more_buffers: dict[str, dict] = {}
-```
+### 4.2 Replies
 
-### 4.2 Lifecycle
-
-1. When `Formatter.chunk(response)` returns > 1 chunks, store them in `_more_buffers[sender]`.
-2. Auto-send the first `auto_send_chunks` (config default: 3) chunks.
-3. If more chunks remain, append indicator to last auto-sent chunk:
-   `" +{N} !more"` where N is remaining chunk count. This must fit within 230 bytes.
-4. `!more` without argument → send next unsent chunk (increment internal cursor).
-5. `!more N` → re-send chunk N (1-indexed). Handles packet loss on lossy channels.
-6. Buffer expires after `more_buffer_ttl_seconds` (default: 600 = 10 minutes).
-7. After last chunk is sent, respond: `"[End of response]"`
-
-### 4.3 `!more` with no buffer
-
-If sender has no active buffer (expired or never set):
-`"No queued response. Send a query first."`
+| Situation | Reply |
+|-----------|-------|
+| No buffer (never set or expired) | `No pending response. Send a question first.` |
+| All chunks sent | `End of response. No more chunks.` |
+| `!more N` out of range | `No chunk N. Response has M parts.` |
 
 ---
 
-## 5. Query Worker
+## 5. Dispatcher and Query Worker
 
-### 5.1 Architecture
+`del_fi/core/dispatcher.py` — the daemon's main loop, unit-tested directly
+(`tests/test_dispatcher.py`). `main.py` only wires it up.
 
-A single background `threading.Thread` reads from `msg_queue: queue.Queue`.
-Using a single worker provides:
-- Natural FIFO ordering per sender
-- No concurrent LLM calls (which would exceed memory budget on small hardware)
-- Simple backpressure: queue.Full drops the oldest item with a log warning
+### 5.1 Inbound handling (dispatcher thread)
 
-```python
-msg_queue = queue.Queue(maxsize=20)  # configurable: query_queue_size
-```
+| Message | Handling |
+|---------|----------|
+| empty | ignored |
+| gossip (`DEL-FI:`) | `router.route()` inline; no reply |
+| command (except `!retry`) | `router.route_multi()` inline; replies sent immediately |
+| question, or `!retry` | rate limit → queue → worker |
 
-If queue is full when a new query arrives: discard the oldest item and enqueue
-the new one. Log: `"queue full — dropped oldest query from %s"`
+`!retry` asks `router.prepare_retry(sender)` for the sender's last question
+(evicting its cached answer) and then goes through the same path as a new
+question, so it runs on the worker and counts against the rate limit.
 
-### 5.2 Worker loop
+### 5.2 Rate limit and queue
 
-```python
-def _query_worker(self) -> None:
-    while not self._shutdown.is_set():
-        try:
-            item = self._msg_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        
-        sender, query = item
-        try:
-            response = self._run_tier_hierarchy(sender, query)
-            response = self._formatter.format(response)
-            chunks = self._formatter.chunk(response)
-            self._store_more_buffer(sender, query, chunks)
-            for i, chunk in enumerate(chunks[:self._auto_send_chunks]):
-                self._adapter.send_dm(sender, chunk)
-                if i < len(chunks) - 1:
-                    time.sleep(self._chunk_delay_seconds)
-        except Exception:
-            log.exception("Query worker error for sender %s", sender)
-            self._adapter.send_dm(sender, self._config.get("error_message", "Error."))
-        finally:
-            self._msg_queue.task_done()
-```
+1. **Rate limit** (`rate_limit_seconds`, default 30, 0 = off): one accepted
+   question per sender per window, measured with a monotonic clock (immune
+   to the wall-clock jumps a Pi without an RTC makes when NTP syncs). A
+   rate-limited question gets **one** reply per window —
+   `"NODE: One question per 30s, please. Try again in 12s. Commands still work."`
+   — and further ones are dropped silently (`rate_limit_notice: false`
+   silences the reply too).
+2. **Queue depth** (`query_queue_size`, default 10): when full, the new
+   question is turned away with `"NODE: Too many questions queued right now.
+   Try again in a few minutes."`. Queued questions are never dropped.
+3. **Busy notice** (`busy_notice`, default on): if the worker is busy, a
+   sender with nothing else pending gets `router.busy_message(position)` —
+   "yours is next" or "N questions ahead of yours".
 
-### 5.3 Shutdown
+### 5.3 Worker
 
-`self._shutdown` is a `threading.Event`. Set on SIGINT/SIGTERM. The worker exits
-cleanly after completing the current in-flight item.
+One worker thread, one LLM call at a time (small hardware cannot afford
+more). For each question it sends `router.route_multi()`'s messages with a
+0.5 s pause between chunks. Any exception is logged with its traceback and
+the sender gets `"I hit an error processing that. Try again."`.
+
+### 5.4 Shutdown
+
+SIGINT/SIGTERM set the stop flag; `Dispatcher.run()` returns within half a
+second, then `main.py` flushes the response cache and closes the radio. An
+in-flight LLM call is abandoned (waiting up to `ollama_timeout` would exceed
+systemd's default stop timeout).
 
 ---
 
@@ -285,120 +275,121 @@ See `.claude/claude.md §7` for the overview. Router-specific detail:
 
 ### 6.1 Tier 0 — FactStore
 
+`facts.lookup(query)` is a keyword match, not a semantic search. When it
+returns a reading, that string is the answer: no LLM call, no cache.
+
+### 6.2 Response cache, then Tier 1 — WikiEngine
+
 ```python
-fact = self._fact_store.lookup(query)
-if fact:
-    return fact    # no LLM call
+answer, had_context = wiki.query(query, history=history, board_context=board_ctx)
 ```
 
-`lookup()` is a keyword match, not a semantic search. If any keyword from
-`fact_query_keywords` config list appears in the normalised query, FactStore
-returns the relevant sensor reading. Fast path: no Ollama call, no disk I/O.
+`had_context=False` means no wiki page matched, or the model declined to
+answer from the pages it was given; the router falls through to Tier 2.
+If Ollama is not available, the reply says so honestly (no tiers are tried).
 
-### 6.2 Tier 1 — WikiEngine
+### 6.3 Generation failures
+
+`wiki.query()` raises `LLMError` when generation fails. The router never
+turns a failure into "I don't have docs on that":
+
+| `LLMError.kind` | Cause | Reply |
+|-----------------|-------|-------|
+| `unavailable` | Ollama unreachable (also marks it down so the health loop takes over) | "My language model isn't reachable right now…" |
+| `timeout` | Model too slow for `ollama_timeout` | "That took too long… or !retry in a minute." |
+| `error` | Anything else (e.g. model not pulled) | "I hit an error answering that…" |
+
+### 6.4 Tier 2 — PeerCache
 
 ```python
-answer, source = self._wiki_engine.query(
-    query,
-    peer_context=peer_ctx,          # injected if Tier 2 had partial match
-    history=self._memory.get_context(sender),
-)
-if answer:                          # non-empty, non-fallback response
-    self._response_cache[cache_key] = answer
-    return answer
+peer = peer_cache.lookup(query)
+if peer:
+    return peer["response"], peer["peer_name"]   # rendered as "[via NODE] …"
 ```
 
-### 6.3 Tier 2 — PeerCache
+The peer's answer is returned as-is with its provenance label; there is no
+second LLM call to re-synthesise it.
+
+### 6.5 Tier 3 — GossipDirectory
 
 ```python
-peer_answer = self._peer_cache.lookup(query)
-if peer_answer:
-    return peer_answer   # already contains "[via NODE]" label
-```
-
-If no direct match but a partial match exists, pass `peer_ctx` to Tier 1 query
-(see §6.2 above).
-
-### 6.4 Tier 3 — GossipDirectory
-
-```python
-referral = self._gossip_dir.referral(query)
+referral = gossip_dir.referral(query)
 if referral:
     return referral      # e.g. "Try VALLEY-ORACLE — covers fishing, lake-levels"
 ```
 
-### 6.5 Fallback
+### 6.6 Fallback
 
-```python
-return self._config.get(
-    "fallback_message",
-    "I don't have docs on that. Try !topics."
-)
-```
+The `fallback_message` config value if set; otherwise a suggestion listing
+known topics (`wiki.suggest()`); otherwise
+`"<NODE>: I don't have docs on that. Try !topics to see what I know."`
 
 ---
 
 ## 7. Gossip Announcement Protocol
 
+Opt-in: `mesh_knowledge.gossip.enabled: true` turns on both announcing and
+listening. When off, announcements are ignored, `!peers` says gossip is
+off, and Tier 3 referrals never fire.
+
 ### 7.1 Announcement format
 
 ```
-DEL-FI:{version}:ANNOUNCE:{NODE_NAME}:topics={t1},{t2}:model={model}:uptime={Xd}:docs={N}
+DEL-FI:1:ANNOUNCE:{NODE_NAME}:topics={t1},{t2}:model={model}
 ```
 
-- `version`: protocol integer (currently `1`)
-- `NODE_NAME`: `ALL-CAPS-HYPHENATED` node name
-- `topics`: comma-separated list of wiki page titles (or knowledge folder names)
-- `uptime`: human-readable days
-- `docs`: integer count of knowledge files
+- `NODE_NAME`: `A-Z0-9-`, max 32 chars
+- `topics`: wiki page slugs from this node's `wiki/index.md` (first column
+  only), as many as fit in one message (`max_response_bytes`)
+- `model`: always last; runs to the end of the message because model names
+  contain colons (`llama3.2:3b`)
 
-Announcement is broadcast (not DM) at `gossip_interval_seconds` (default: 14400 = 4h).
-Announcements are short: must fit in 230 bytes.
+Broadcast on `gossip.channel` (default 0) every `gossip.announce_interval`
+(default 4 h, minimum 15 min) ± 10%, the first one 1–5 minutes after
+startup so nodes rebooting together after a power cut don't transmit at
+once. A node with no wiki topics does not announce. Announcements arrive
+as broadcasts (the Meshtastic adapter forwards `DEL-FI:` broadcasts) or
+DMs; both are handled inline, without rate limiting or a reply.
 
-### 7.2 Gossip directory TTL
+### 7.2 Directory
 
-Received announcements expire after `gossip_ttl_seconds` (default: 86400 = 24h).
-Expired entries are pruned on each receive and on each `!peers` query.
+- Keyed by the **sender's node ID**, not the announced name, so a second
+  node claiming a name cannot overwrite the first.
+- Announcements are unauthenticated: names, topics (max 12, `a-z0-9-`,
+  max 32 chars each) and model are sanitised; the directory holds at most
+  64 nodes (oldest evicted).
+- Entries expire after `gossip.directory_ttl` (default 24 h).
+- Saved to `gossip/node-directory.json` only when an entry is new or
+  changed, or its last-seen time is over an hour stale — not on every
+  announcement (SD card wear).
 
-### 7.3 Topic matching for referrals
+### 7.3 Referrals (Tier 3)
 
-```python
-def referral(self, query: str) -> str | None:
-    """
-    Find a peer node whose topics overlap with query keywords.
-    Returns referral string or None.
-    """
-    query_words = set(query.lower().split()) - STOP_WORDS
-    best_node = None
-    best_score = 0
-    for node, entry in self._directory.items():
-        topic_words = set(" ".join(entry["topics"]).lower().split())
-        score = len(query_words & topic_words)
-        if score > best_score:
-            best_score = score
-            best_node = node
-    if best_node and best_score > 0:
-        topics = ", ".join(self._directory[best_node]["topics"][:3])
-        return f"Try {best_node} — covers {topics}"
-    return None
+The node sharing the most question words with its topics wins; generic
+topic words (`guide`, `log`, `notes`, `overview`, `area`, …) don't count.
+
 ```
+Try VALLEY-ORACLE (!a1b2c3d4) — covers geology, mining, local-history
+```
+
+The node ID is included so the user can DM the right node even if another
+node uses the same display name.
 
 ---
 
 ## 8. "Seen Senders" First-Contact Tracking
 
-The first time a sender contacts the node, the response appends a welcome footer
-(if one is configured). This is tracked in `seen_senders.txt` (one ID per line),
-loaded on startup, flushed on clean shutdown.
+A sender's first single-message answer gets a footer:
 
-Config key: `welcome_footer` (default: empty string → no footer appended).
-
-```yaml
-welcome_footer: "New here? Try !help"
+```
+---
+Del-Fi oracle · 12 pages · !help !topics
 ```
 
-The footer is appended within the 230-byte budget. If the response + footer would
-exceed 230 bytes, the footer is omitted (silently).
+The footer is only added when the answer plus footer fits in one message; the
+sender is marked as seen once they have received the footer (or the greeting
+reply to "hi"/"hello"). Seen IDs are stored one per line in
+`seen_senders.txt`, rewritten atomically on each new sender.
 
 ---
 

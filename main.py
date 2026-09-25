@@ -1,4 +1,4 @@
-"""Del-Fi daemon entry point (v0.2).
+"""Del-Fi daemon entry point.
 
 Usage:
   python main.py [--config PATH] [--simulator]
@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import logging
+import logging.handlers
 import os
 import queue
 import signal
@@ -15,18 +16,16 @@ import sys
 import threading
 import time
 
+from del_fi import __version__
 from del_fi.config import load_config
+from del_fi.core.dispatcher import Dispatcher
 from del_fi.core.facts import FactStore
-from del_fi.core.formatter import byte_len
 from del_fi.core.knowledge import WikiEngine
 from del_fi.core.peers import GossipDirectory, PeerCache
 from del_fi.core.router import Router
 from del_fi.mesh import create_interface
 
-VERSION = "0.2"
-
-# Pause between auto-sent consecutive chunks (reduces channel congestion).
-_AUTO_SEND_DELAY = 0.5
+VERSION = __version__
 
 log = logging.getLogger("del_fi")
 
@@ -37,19 +36,43 @@ log = logging.getLogger("del_fi")
 class _DelFiFormatter(logging.Formatter):
     def format(self, record):
         ts = time.strftime("%H:%M:%S", time.localtime(record.created))
-        return f"[{ts}] {record.getMessage()}"
+        text = f"[{ts}] {record.getMessage()}"
+        if record.exc_info:
+            text += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            text += "\n" + self.formatStack(record.stack_info)
+        return text
 
 
-def setup_logging(level: str, simulator: bool = False):
+def setup_logging(level: str, log_file: str = "", simulator: bool = False):
+    """Log to stderr (journald under systemd) and/or a rotating file.
+
+    In simulator mode stdout is the chat, so logs go to the file only.
+    """
     numeric = getattr(logging, level.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(numeric)
-    if simulator:
-        handler = logging.FileHandler("del_fi.log", mode="a", encoding="utf-8")
-    else:
-        handler = logging.StreamHandler()
-    handler.setFormatter(_DelFiFormatter())
-    root.addHandler(handler)
+    handlers: list[logging.Handler] = []
+    if not simulator:
+        handlers.append(logging.StreamHandler())
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        # Rotated so a busy node cannot fill the SD card.
+        handlers.append(logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        ))
+    for handler in handlers:
+        handler.setFormatter(_DelFiFormatter())
+        root.addHandler(handler)
+    # The ollama client's HTTP library logs every request at INFO.
+    logging.getLogger("httpx").setLevel(max(numeric, logging.WARNING))
+
+
+def default_log_file(cfg: dict, simulator: bool) -> str:
+    """log_file from config; in simulator mode, del_fi.log next to the config."""
+    if cfg.get("log_file"):
+        return cfg["log_file"]
+    return os.path.join(cfg["_config_dir"], "del_fi.log") if simulator else ""
 
 
 # ─────────────────────────── Banner ───────────────────────────────────────
@@ -99,14 +122,16 @@ def ollama_health_check(wiki: WikiEngine, stop: threading.Event):
         stop.wait(30)
 
 
-def cache_flush_worker(router: Router, stop: threading.Event):
-    """Flush response cache to disk once per minute (reduces SD card wear)."""
-    while not stop.is_set():
-        stop.wait(60)
+def maintenance_worker(router: Router, stop: threading.Event):
+    """Once a minute: flush the response cache to disk (batched to reduce
+    SD card wear) and drop expired conversation memory."""
+    while not stop.wait(60):
         try:
             router.flush_cache()
-        except Exception as e:
-            log.error(f"cache flush error: {e}")
+            if router.memory:
+                router.memory.cleanup()
+        except Exception:
+            log.exception("maintenance error")
 
 
 # ─────────────────────────── Non-daemon modes ─────────────────────────────
@@ -180,22 +205,22 @@ def run_daemon(cfg: dict, simulator: bool):
     # Router
     router = Router(cfg, wiki, peer_cache, gossip_dir, fact_store=fact_store)
 
-    # Mesh adapter
-    msg_queue: queue.Queue = queue.Queue()
-    mesh_iface = create_interface(cfg, simulator, msg_queue)
+    # Mesh adapter + dispatcher
+    inbox: queue.Queue = queue.Queue()
+    mesh_iface = create_interface(cfg, simulator, inbox)
+    dispatcher = Dispatcher(cfg, router, mesh_iface.send_dm)
 
     if simulator:
-        mesh_iface.connect()
+        print_banner(cfg, wiki, mesh_iface, gossip_dir)
+        mesh_iface.connect()  # starts the stdin chat prompt
     else:
         if not mesh_iface.connect():
-            log.warning("radio not connected — entering reconnect loop")
-            threading.Thread(
-                target=mesh_iface.reconnect_loop, daemon=True
-            ).start()
-
-    # Banner
-    print_banner(cfg, wiki, mesh_iface, gossip_dir)
-    log.info("listening...")
+            log.warning("radio not connected — will keep retrying")
+        # Supervisor: reconnects whenever the link drops, for the daemon's life.
+        threading.Thread(
+            target=mesh_iface.reconnect_loop, name="radio-supervisor", daemon=True
+        ).start()
+        print_banner(cfg, wiki, mesh_iface, gossip_dir)
 
     # Stop event for all background threads
     stop_event = threading.Event()
@@ -209,118 +234,42 @@ def run_daemon(cfg: dict, simulator: bool):
         target=ollama_health_check, args=(wiki, stop_event), daemon=True
     ).start()
 
-    # Background: cache flush
+    # Background: cache flush + memory cleanup
     threading.Thread(
-        target=cache_flush_worker, args=(router, stop_event), daemon=True
+        target=maintenance_worker, args=(router, stop_event), daemon=True
     ).start()
 
     # Background: sensor feed watcher
     fact_store.watch(stop_event)
 
-    # Signal handling
+    # Background: gossip announcements (opt-in: mesh_knowledge.gossip.enabled)
+    if gossip_dir.enabled:
+        threading.Thread(
+            target=gossip_dir.announce_loop,
+            args=(mesh_iface.send_broadcast, stop_event),
+            name="gossip-announcer",
+            daemon=True,
+        ).start()
+        log.info(
+            f"gossip on: announcing every {int(gossip_dir.announce_interval)}s "
+            f"on channel {gossip_dir.channel}"
+        )
+
+    # Signal handling: stop the loops; cleanup runs below, on the main thread.
     def shutdown(sig, frame):
         log.info("shutting down...")
         stop_event.set()
-        router.flush_cache()
-        mesh_iface.close()
-        sys.exit(0)
+        dispatcher.stop()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # ─── Query worker ──────────────────────────────────────────────────────
-    query_queue: queue.Queue = queue.Queue()
-    router.query_queue = query_queue  # enables !retry re-queue to worker thread
-    worker_busy = threading.Event()
-    pending_senders: set[str] = set()
-    pending_lock = threading.Lock()
-    busy_notice_on = cfg.get("busy_notice", True)
+    dispatcher.start()
+    log.info("listening...")
+    dispatcher.run(inbox)  # returns after shutdown()
 
-    def query_worker():
-        while not stop_event.is_set():
-            try:
-                sender_id, text = query_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            worker_busy.set()
-            try:
-                messages = router.route_multi(sender_id, text)
-                if messages:
-                    for i, msg in enumerate(messages):
-                        if i > 0:
-                            time.sleep(_AUTO_SEND_DELAY)
-                        mesh_iface.send_dm(sender_id, msg)
-                    total_bytes = sum(byte_len(m) for m in messages)
-                    log.info(
-                        f"  \u2713 response: {len(messages)} msg(s), "
-                        f"{total_bytes}B \u2192 {sender_id}"
-                    )
-            except Exception as e:
-                log.error(f"error processing query from {sender_id}: {e}")
-                try:
-                    mesh_iface.send_dm(
-                        sender_id, "I hit an error processing that. Try again."
-                    )
-                except Exception:
-                    pass
-            finally:
-                with pending_lock:
-                    pending_senders.discard(sender_id)
-                worker_busy.clear()
-
-    threading.Thread(target=query_worker, daemon=True).start()
-
-    # ─── Main dispatcher loop ──────────────────────────────────────────────
-    while True:
-        try:
-            sender_id, text = msg_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        except Exception:
-            continue
-
-        try:
-            kind = router.classify(text)
-
-            if kind == "empty":
-                continue
-
-            # Fast path: commands and gossip (no LLM, handled inline)
-            if kind in ("command", "gossip"):
-                messages = router.route_multi(sender_id, text)
-                if messages:
-                    for i, msg in enumerate(messages):
-                        if i > 0:
-                            time.sleep(_AUTO_SEND_DELAY)
-                        mesh_iface.send_dm(sender_id, msg)
-                    total_bytes = sum(byte_len(m) for m in messages)
-                    log.info(
-                        f"  \u2713 response: {len(messages)} msg(s), "
-                        f"{total_bytes}B \u2192 {sender_id}"
-                    )
-                continue
-
-            # Slow path: LLM query → worker thread
-            with pending_lock:
-                already_pending = sender_id in pending_senders
-                pending_senders.add(sender_id)
-
-            if busy_notice_on and worker_busy.is_set() and not already_pending:
-                position = query_queue.qsize() + 1
-                try:
-                    ack = router.busy_message(position)
-                    mesh_iface.send_dm(sender_id, ack)
-                    log.info(
-                        f"  \u23f3 busy notice \u2192 {sender_id} (position {position})"
-                    )
-                except Exception:
-                    pass
-
-            query_queue.put((sender_id, text))
-
-        except Exception as e:
-            log.error(f"dispatcher error from {sender_id}: {e}")
+    router.flush_cache()
+    mesh_iface.close()
 
 
 # ─────────────────────────── Entry point ──────────────────────────────────
@@ -369,7 +318,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg["log_level"], simulator=args.simulator)
+    setup_logging(cfg["log_level"], default_log_file(cfg, args.simulator),
+                  simulator=args.simulator)
     log.info(f"del-fi v{VERSION} starting")
 
     if args.build_wiki:
@@ -380,7 +330,7 @@ def main():
 
     if args.gui:
         from del_fi.gui import launch
-        launch(cfg, args.config or "config.yaml",
+        launch(cfg, cfg["_config_path"],
                port=args.gui_port, open_browser=not args.no_browser)
         return
 

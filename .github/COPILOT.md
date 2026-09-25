@@ -9,8 +9,9 @@ This file is a concise onboarding summary; all detail lives in `.claude/`.
 ## What this project is
 
 Del-Fi is an offline AI oracle daemon for LoRa mesh radio networks. It bridges
-Meshtastic / MeshCore radios with locally-hosted LLMs (via Ollama) and a compiled
-wiki knowledge base. Everything runs on local hardware — no internet, no cloud.
+Meshtastic radios (MeshCore: stub) with locally-hosted LLMs (via Ollama) and a
+compiled wiki knowledge base. Everything runs on local hardware — no internet,
+no cloud.
 
 The single hardest constraint: **every response must be ≤ 230 bytes** (LoRa limit).
 
@@ -28,12 +29,17 @@ The single hardest constraint: **every response must be ≤ 230 bytes** (LoRa li
 | `.claude/spec-memory.md` | Conversation memory, message board, FactStore |
 | `.claude/spec-config.md` | All config keys, types, defaults, oracle profiles |
 | `.claude/brand.md` | Visual identity, response tone, oracle persona types |
-| `main.py` | Entrypoint (`--simulator`, `--build-wiki`, `--lint-wiki`) |
+| `main.py` | Entrypoint (`--simulator`, `--build-wiki`, `--lint-wiki`, `--gui`) |
+| `del_fi/core/dispatcher.py` | Main loop: rate limit, question queue, worker thread |
+| `del_fi/core/router.py` | Commands and the tier hierarchy |
+| `del_fi/core/knowledge.py` | WikiEngine: build, passage retrieval, lint, watcher |
 | `config.example.yaml` | Portable config template (commit this; not `config.yaml`) |
+| `CHANGELOG.md` | What changed per version |
 
-> **Current state:** Codebase is mid-rehaul. Root-level files (`rag.py`, `router.py`,
-> etc.) are v0.1. The `del_fi/` package structure described in the spec is the
-> Phase 2 target. Work against the spec when planning new features.
+> **Current state (v0.3):** the `del_fi/` package *is* the codebase; there are no
+> root-level modules besides `main.py`. The `.claude/` specs describe what is
+> built — anything they mark "planned" or "roadmap" (peer Q&A sync, MeshCore,
+> `patch()`, asyncio) is not.
 
 ---
 
@@ -41,7 +47,7 @@ The single hardest constraint: **every response must be ≤ 230 bytes** (LoRa li
 
 1. Read the relevant `.claude/spec-*.md` for the module you are touching.
 2. Check the testing contract in `.claude/claude.md §11`.
-3. Run `python -m unittest discover tests/` to confirm no regressions.
+3. Run `python -m unittest discover -s tests -t .` to confirm no regressions.
 4. The formatter always runs last before a radio send — never bypass it.
 
 ---
@@ -50,8 +56,9 @@ The single hardest constraint: **every response must be ≤ 230 bytes** (LoRa li
 
 - **230-byte limit** — every outbound radio message, always, no exceptions.
 - **Offline-first** — no HTTP calls to external services at runtime.
-- **No hallucination** — LLM answers only from provided wiki/context; if context
-  is empty, return the configured fallback message.
+- **No hallucination** — LLM answers only from retrieved passages; if nothing
+  matches, the next tier or the fallback message answers. Never fall back to the
+  model's training knowledge, and never claim "no docs" when the model failed.
 
 ---
 
@@ -66,9 +73,6 @@ The single hardest constraint: **every response must be ≤ 230 bytes** (LoRa li
 
 ---
 
-<!-- Previous v0.1 inline architecture notes replaced by .claude/ spec system. -->
-<!-- See git history for the original COPILOT.md content. -->
-
 Del-Fi Net is the network layer: a trust-based peering system that lets independent oracle nodes share knowledge, refer users to each other, and collectively form a distributed knowledge mesh — like BBS sysops exchanging echomail, but for AI-generated answers.
 
 The guiding principle is **radical simplicity**. A non-developer maker who can flash a Meshtastic radio should be able to get Del-Fi running in under 30 minutes. Every design decision should be evaluated against this: does it make the first-run experience harder?
@@ -77,133 +81,33 @@ The guiding principle is **radical simplicity**. A non-developer maker who can f
 
 - **Ship the 500-line script first.** The MVP is a single Python file with a core loop. Do not build frameworks, plugin systems, or abstractions until the core loop is solid and tested.
 - **Boring technology.** Python, Ollama, ChromaDB, Meshtastic Python API. No exotic dependencies. No Rust rewrites. No custom inference engines. Every dependency should be installable with pip or a single curl command.
-- **Degrade gracefully.** If Ollama crashes, keep relaying Meshtastic messages. If the radio disconnects, reconnect automatically. If the vector store is empty, fall back to raw LLM. Never crash the daemon.
+- **Degrade gracefully.** If Ollama crashes, keep answering commands and say honestly that the model is unreachable. If the radio disconnects, reconnect automatically. If the vector store is missing, keyword search still works. Never crash the daemon.
 - **Respect the channel.** LoRa is a shared, low-bandwidth medium. Every byte transmitted is airtime stolen from the mesh. Responses must be maximally compressed. Never send unnecessary messages.
 - **No cloud, no phoning home, no telemetry.** This runs air-gapped by design.
 - **Terminal aesthetic.** This is a BBS, not a SaaS product. Box-drawing characters, monospaced type, DOS-style status frames, green-on-black energy. The interface should feel like discovering something in the wild, not signing up for a service.
 
-## Architecture
+## Architecture (v0.3)
 
-Five components, all in-process (single Python daemon):
+One process, threads plus `queue.Queue` (no asyncio):
 
 ```
-[LoRa Radio] <--serial/tcp/ble--> [Mesh Interface] <--> [Query Router] <--> [RAG Engine]
-                                                                |                  |
-                                                        [Response Formatter]  [Mesh Knowledge]
+[LoRa Radio] <--> [MeshAdapter] --inbox--> [Dispatcher] --commands (inline)--> [Router]
+                  reconnect                 rate limit,  --questions--> worker --> [Router]
+                  supervisor                bounded queue                            |
+                                                   Tier 0 facts · Tier 1 wiki · Tier 2 peers · Tier 3 gossip
+                                                                          [Formatter] ≤ 230 B
 ```
 
-### 1. Mesh Interface (`mesh.py`)
-
-Wraps the Meshtastic Python API. Responsibilities:
-
-- Connect to radio via serial, TCP, or BLE (configurable)
-- Listen for incoming text messages on ALL channels (broadcasts and DMs)
-- **Respond only via DM to the sender.** Never broadcast responses. Broadcasts are received and logged but do not trigger replies.
-- Handle automatic reconnection on radio disconnect
-- Rate limit per sender (configurable, default: 1 query per 30 seconds)
-- **Commands (`!` prefix) bypass the rate limiter.** Only freeform queries are rate-limited. `!more`, `!ping`, `!help`, etc. always go through immediately.
-- Track seen message IDs to avoid processing duplicates
-- Chunk outgoing messages that exceed the ~230 byte LoRa limit
-- Provide a simple callback interface: `on_message(sender_id, text) -> None`
-
-**Design notes:**
-- Use the `meshtastic` Python package's pub/sub interface
-- Run the listener in its own thread
-- Outgoing message queue with configurable inter-chunk delay (default: 3 seconds between chunks to avoid flooding)
-
-### 2. Query Router (`router.py`)
-
-Receives cleaned text from the mesh interface and decides what to do with it.
-
-**Command prefix:** Messages starting with `!` are system commands. Everything else is a query.
-
-**Built-in commands:**
-- `!status` — Node name, model, uptime, knowledge base stats, queue depth
-- `!topics` — List loaded knowledge base topics/folders
-- `!help` — Brief usage instructions
-- `!more` — Send the next chunk of a previously truncated response
-- `!ping` — Simple liveness check, responds with node name
-- `!peers` — List peered nodes and their topic areas (mesh knowledge)
-
-**Query routing logic (in order):**
-1. If message starts with `!`, dispatch to command handler
-2. Check the response cache — if this exact query (or very similar) was recently answered, return cached response
-3. Send to RAG engine for knowledge-base-augmented generation
-4. If RAG retrieval finds no relevant documents (similarity below threshold), check mesh knowledge cache (Tier 2) for relevant peer answers
-5. If still no relevant context, check gossip directory for a node that might know — return a referral
-6. Fall back to raw LLM generation (honest "I don't have specific docs on that, but..." response)
-
-**Design notes:**
-- Keep the router dead simple. A series of if/elif checks. No state machines, no intent classifiers, no NLP preprocessing.
-- The `!more` command requires keeping a per-sender buffer of the last full (untruncated) response, plus a cursor tracking which chunk was last sent. `!more` sends the next unsent chunk. `!more 2` resends chunk 2 specifically (handles lossy channel — if a chunk is lost, user can re-request without accidentally skipping). Expire buffers after 10 minutes.
-- Track a set of "seen senders" to know whether to append the welcome footer on first contact. Persist this across restarts if possible (a simple text file of sender IDs), but losing it is harmless — worst case, someone gets the welcome footer twice.
-
-### 3. RAG Engine (`rag.py`)
-
-Handles document ingestion, embedding, retrieval, and LLM generation.
-
-**Document ingestion:**
-- Watch a configurable folder (default: `~/del-fi/knowledge/`) for file changes
-- On new/modified file: extract text, chunk, embed, store vectors
-- On deleted file: remove associated vectors
-- Supported formats (MVP): `.txt`, `.md`
-- **PDF support is deferred.** `pymupdf` is a C extension that's finicky to build on ARM and could break the 30-minute first-run promise. Add it as an optional extra after the core loop is solid. When added, use a `try: import pymupdf` guard with a graceful log message if unavailable.
-- Chunking: fixed-size with overlap (default: 512 tokens, 64 token overlap)
-- Embedding model: `nomic-embed-text` via Ollama (runs on CPU, small footprint)
-
-**Retrieval:**
-- On query: embed the query, retrieve top-k chunks (default k=3) from ChromaDB
-- Similarity threshold: discard chunks below cosine similarity 0.3
-- Build a prompt: system message + retrieved context + user query
-- **Tag all retrieved context with its source tier** — local docs are unmarked, mesh cache is explicitly labeled as unverified peer knowledge
-
-**Generation:**
-- Call Ollama's `/api/generate` endpoint — **committed choice for MVP.** Simpler than `/api/chat`, fewer tokens, and single-turn is the natural fit for LoRa Q&A. Multi-turn conversation would require per-sender state and complexity budget we don't have. If `/api/chat` is ever needed, it's a future upgrade.
-- System prompt template (configurable):
-  ```
-  You are {node_name}, a helpful AI assistant serving a community over
-  low-bandwidth mesh radio. Answer concisely using the provided context.
-  If the context doesn't contain the answer, say so briefly.
-  Keep responses under {max_response_chars} characters.
-  ```
-- Inject retrieved chunks as context between system prompt and user query
-- Stream the response from Ollama, collect full text, pass to formatter
-
-**Design notes:**
-- ChromaDB in persistent SQLite mode (no server process)
-- The folder watcher can be a simple polling loop (check mtime every 60 seconds) — no need for inotify/watchdog in MVP
-- Pre-index on startup: scan the folder and ensure all files are indexed
-- Vector store metadata MUST include `source:local` vs `source:mesh:NODE-ID:timestamp` — this is how the trust tier boundary is enforced
-
-### 4. Response Formatter (`formatter.py`)
-
-Takes the raw LLM output and prepares it for LoRa transmission.
-
-**Pipeline:**
-1. Strip markdown formatting (bold, headers, lists → plain text)
-2. Collapse whitespace
-3. If response includes mesh-sourced knowledge, prepend provenance tag: `[via NODE-NAME]`
-4. If response fits in one message (≤ max_response_bytes), send as-is
-5. If too long, attempt to truncate at the last complete sentence that fits
-6. If truncated, append " [!more]" indicator and store the full response for the `!more` command
-7. Encode as UTF-8, verify byte count
-
-**Do NOT use the LLM for compression in MVP.** That doubles inference time for every response. Simple truncation with a sentence boundary detector is good enough. LLM-based compression is a future optimization.
-
-**Design notes:**
-- `max_response_bytes` defaults to 230 (leaving headroom below the Meshtastic protocol limit)
-- For multi-chunk responses via `!more`, each chunk should make sense independently — don't split mid-sentence
-- Provenance tags cost bytes. A `[via MARINA-ORACLE]` tag is ~22 bytes. This is the cost of honesty — worth it.
-
-### 5. Mesh Knowledge (`meshknowledge.py`)
-
-Manages the three-tier knowledge system for inter-oracle communication. This is the Del-Fi Net layer.
-
-**This module is entirely optional.** A node with no mesh knowledge configuration works exactly as a standalone oracle. Mesh features are additive, never required.
-
-See the "Del-Fi Net: The Knowledge Mesh" section below for full architecture.
+Module-by-module detail lives in the specs: adapters in `spec-mesh.md`,
+dispatcher/router/tiers in `spec-router.md`, retrieval in `spec-knowledge.md`,
+formatting in `spec-formatter.md`, memory/board/facts in `spec-memory.md`,
+every config key in `spec-config.md`.
 
 ## Del-Fi Net: The Knowledge Mesh
+
+> **v0.3 status:** Tier 3 gossip (announcements + referrals) is implemented and
+> opt-in. Tier 2 storage (`PeerCache`, trust by node ID) exists, but the sync
+> protocol that fills it does not yet. The design below is the target.
 
 One node is useful. A network is powerful. Del-Fi Net connects oracles into a knowledge mesh where each node maintains its own curated knowledge base but can share what it knows through a trust-based peering system.
 
@@ -454,113 +358,13 @@ These inform design decisions. The system should work well for all of them.
 
 **Astronomy Guide** — Dark sky site with tonight's visible objects, constellations, meteor showers, satellite passes. Pairs naturally with outdoor deployment.
 
-## Configuration
+## Configuration, layout, conventions
 
-Single YAML file at `~/del-fi/config.yaml`:
-
-```yaml
-# Required
-node_name: "DEL-FI-001"
-model: "qwen2.5:3b"
-
-# Optional (sensible defaults)
-personality: "Helpful and concise community assistant."
-knowledge_folder: ~/del-fi/knowledge
-max_response_bytes: 230
-radio_connection: serial     # serial | tcp | ble
-radio_port: /dev/ttyUSB0     # or hostname:port for TCP
-rate_limit_seconds: 30
-response_cache_ttl: 300
-embedding_model: "nomic-embed-text"
-channels: []                 # empty = listen on all channels
-log_level: info
-ollama_host: "http://localhost:11434"
-ollama_timeout: 120          # seconds
-
-# Mesh Knowledge (entirely optional)
-mesh_knowledge:
-  gossip:
-    enabled: true
-    announce_interval: 14400
-    directory_ttl: 86400
-  peers: []
-  sync:
-    enabled: false
-    window_start: "02:00"
-    window_end: "05:00"
-    max_cache_age: 7d
-    max_cache_entries: 500
-  serve_to_peers: false
-  tag_responses: true
-  reject_contradictions: true
-```
-
-**Rules:**
-- Every field except `node_name` and `model` has a default
-- Invalid config should produce a clear, human-readable error on startup, not a Python traceback
-- Config is read once at startup. No hot-reload in MVP.
-
-## Project Structure
-
-```
-del-fi/
-├── delfi.py              # Entry point, daemon lifecycle
-├── mesh.py               # Meshtastic interface
-├── router.py             # Query routing and command handling
-├── rag.py                # Document ingestion, retrieval, generation
-├── formatter.py          # Response compression and chunking
-├── config.py             # Config loading and validation
-├── meshknowledge.py      # Mesh knowledge: gossip, peering, sync (optional)
-├── requirements.txt      # Python dependencies
-├── config.example.yaml   # Example configuration
-├── README.md
-├── TESTING.md            # Chaos testing procedures
-├── LICENSE               # GPL-3.0 (matching Meshtastic)
-├── knowledge/            # Default knowledge folder (ships empty)
-│   └── .gitkeep
-├── cache/                # Mesh knowledge cache (created at runtime)
-└── tests/
-    ├── test_formatter.py
-    ├── test_router.py
-    └── test_rag.py
-```
-
-Seven Python files. Two folders. That's it.
-
-## Startup Ordering
-
-The daemon starts up in a defined sequence. Each step has explicit fail/retry behavior.
-
-1. **Config** — Load and validate `config.yaml`. On failure: print human-readable error and exit. This is the one place where crashing is correct — a bad config can't be recovered from.
-2. **ChromaDB** — Open or create the persistent vector store. On failure: log error, disable RAG (fall back to raw LLM for all queries). The daemon continues.
-3. **Knowledge indexing** — Scan the knowledge folder and index any new/changed files. On failure of individual files: log and skip that file, continue with the rest. On total failure (e.g., empty folder): log warning, continue — the node just has no local docs.
-4. **Ollama** — Check that Ollama is reachable and the configured model is available. On failure: log warning, enter a retry loop (check every 30 seconds). The daemon starts but responds to queries with "I'm still warming up, try again in a minute." Commands (`!help`, `!status`, `!ping`) work immediately — they don't need the LLM.
-5. **Radio** — Connect to the Meshtastic radio. On failure: log error, enter reconnect loop (retry every 10 seconds). If running in `--simulator` mode, skip this and use stdin/stdout.
-6. **Ready** — Print the startup banner. Begin listening.
-
-The key principle: **always start, never block.** A missing radio or unavailable Ollama shouldn't prevent the daemon from launching. Components come online as they become available. `!status` reflects the real-time health of each component.
-
-## Dependencies (MVP)
-
-```
-meshtastic>=2.3.0
-ollama>=0.2.0
-chromadb>=0.5.0
-pyyaml>=6.0
-# pymupdf>=1.24.0        # PDF text extraction — deferred, optional
-```
-
-Four dependencies for MVP. Keep it lean. `meshknowledge.py` uses only stdlib (sqlite3, json, time).
-
-## Code Style
-
-- Python 3.10+ (match Raspberry Pi OS default)
-- Type hints on function signatures, not on locals
-- Logging via stdlib `logging`, not print statements
-- No classes unless they hold mutable state. Most modules export functions.
-- No async/await — threads are simpler to reason about on constrained hardware
-- Error handling: catch specific exceptions, log them, continue the daemon loop. Never let an exception in one query kill the daemon.
-- Comments should explain *why*, not *what*
+- Config keys, defaults and validation: `.claude/spec-config.md` (source of
+  truth: `DEFAULTS` in `del_fi/config.py`).
+- Project layout and module contracts: `.claude/claude.md` §6 and §10.
+- Code style: `.claude/claude.md` §11. Threads, not asyncio; catch what you can
+  handle and log the rest with `log.exception`; never crash the daemon loop.
 
 ## Testing
 
@@ -663,13 +467,18 @@ These are the tests that matter most. Do them with real hardware.
 
 ### Unit Tests
 
+Run: `python -m unittest discover -s tests -t .` (no radio or Ollama; CI runs
+Python 3.10–3.13). The notes below are from the original plan; the suite now
+covers every module in `del_fi/`, including the dispatcher, adapters (via
+fakes), peers/gossip and the GUI.
+
 - `formatter.py` is pure functions — easy to test. Cover: sentence boundary detection, byte count accuracy, markdown stripping, `!more` indicator placement, provenance tag insertion.
 - `router.py` command parsing — cover all `!` commands, unknown commands, edge cases.
-- `meshknowledge.py` cache operations — insert, retrieve, expire, reject contradictions.
+- `peers.py` cache and gossip operations — insert, retrieve, expire, trust by node ID.
 
 ### Integration Tests
 
-- `rag.py` against a temp ChromaDB with sample documents. Verify: indexing, retrieval, similarity thresholds, source tier tagging.
+- `knowledge.py` against a temp wiki and a fake Ollama client. Verify: build, passage selection within budget, pruning, lint.
 - Full pipeline: synthetic message in → formatted response out (simulator mode).
 
 ## Reference Hardware

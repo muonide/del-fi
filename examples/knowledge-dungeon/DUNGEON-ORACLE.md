@@ -22,8 +22,9 @@ A Game Master oracle for The Shattered Realm, a dark fantasy tabletop RPG settin
 ## Suggested config.yaml
 
 ```yaml
+# The Delver's Guild Oracle at Thornwall Crossroads: the Shattered Realm,
+# dungeons, monsters, and the rules of Delving.
 node_name: "DUNGEON-ORACLE"
-node_description: "The Delver's Guild Oracle at Thornwall Crossroads. Ask about the Shattered Realm, dungeons, monsters, and the rules of Delving."
 oracle_type: "lore"
 
 model: "gemma4:4b"
@@ -49,7 +50,7 @@ personality: >
   Answer only from the provided context. If the answer is not in the records, say so.
   Keep answers to 1-2 sentences. End every response: // DUNGEON-ORACLE
 
-mesh_adapter: simulator   # use 'meshtastic' for radio deployment; simulator for table play
+mesh_protocol: meshtastic   # for table play without radios: python main.py --simulator
 ```
 
 ---
@@ -104,7 +105,7 @@ For a convention booth or outdoor LARP site, use `mesh_adapter: meshtastic` with
 
 To adapt this oracle for your own setting:
 1. Replace all 4 knowledge files with content from your setting
-2. Update `node_name` and `node_description`
+2. Update `node_name`
 3. Update `personality` to match your GM voice
 4. Run `--build-wiki` before the first session
 5. The `wiki_watch_enabled: false` setting is appropriate for static lore; enable it if you update lore files between sessions

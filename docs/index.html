@@ -234,7 +234,7 @@
 
 <!-- Status bar -->
 <div class="statusbar">
-  <span>DEL-FI NET v0.2</span>
+  <span>DEL-FI NET v0.3</span>
   <span id="clock"></span>
 </div>
 
@@ -274,13 +274,13 @@
   <pre>
 Drop documents into a folder. Connect a <span class="white">$30 radio</span>. Your neighborhood now has an AI oracle -- no internet, no cloud, no accounts.
 
-Del-Fi nodes sit on <span class="white">900 MHz and 2.4 GHz meshes simultaneously</span>, bridging coverage across your community. Every node added makes the whole net more useful. When someone sends a DM, Del-Fi finds the relevant docs, asks a <span class="white">local LLM</span>, and replies within the <span class="yellow">230-byte</span> LoRa limit -- everything on your hardware.
+A Del-Fi node is a <span class="white">Meshtastic radio</span> plus a small computer. When someone sends it a DM, Del-Fi finds the relevant passages in your docs, asks a <span class="white">local LLM</span>, and replies within the <span class="yellow">230-byte</span> LoRa limit -- everything on your hardware. With gossip on, nodes point people to each other, so every node added makes the whole net more useful.
 
-Plug in sensors or cameras and the <span class="white">FactStore</span> answers measurement queries directly -- no LLM, no hallucination on facts.
+Have a script write sensor readings to a JSON feed and the <span class="white">FactStore</span> answers measurement questions directly -- no LLM, no made-up numbers.
 
-Drop documents into <span class="white">knowledge/</span>, run <span class="white">--build-wiki</span> once, and the LLM compiles them into a structured wiki. At query time it searches the wiki -- not raw docs -- so even a 1B model gets clean, focused context. The wiki compounds: each new source updates existing pages without losing what came before.
+Drop documents into <span class="white">knowledge/</span>, run <span class="white">--build-wiki</span> once, and the LLM compiles them into a wiki: a page per document, with titles and tags. At question time the wiki finds the right documents, and only their most relevant sections go to the model -- so even a 1B model gets short, focused context. Edit a document and the running node recompiles its page.
 
-<span class="dim">One package. Four dependencies. Fully offline.</span>
+<span class="dim">One Python package. Three core dependencies. Runs fully offline.</span>
 </pre>
 </section>
 
@@ -295,12 +295,12 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
   <pre>
 <span class="white">COMPUTE (pick one)</span>                         <span class="white">RADIO</span>
 
-  Raspberry Pi 5 8GB .... ~$80            Any Meshtastic or
-  Jetson Orin Nano ...... ~$249           MeshCore LoRa radio.
+  Raspberry Pi 5 8GB .... ~$80            Any Meshtastic
+  Jetson Orin Nano ...... ~$249           LoRa radio.
   Mac Mini M4 ........... ~$499           Heltec V3 is ~$20.
 
-  <span class="dim">3B models are the sweet spot.              Antenna placement matters
-  5-10s per response on a Pi.</span>              <span class="dim">more than radio choice.</span>
+  <span class="dim">On a Pi, start with a 1B model;         Antenna placement matters
+  bigger ones answer better, slower.      more than radio choice.</span>
 </pre>
 </section>
 
@@ -311,6 +311,7 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
 <span class="dim">  $</span> <span class="green">curl -fsSL https://ollama.com/install.sh | sh</span>
 <span class="dim">  $</span> <span class="green">ollama pull gemma4:4b && ollama pull nomic-embed-text</span>
 <span class="dim">  $</span> <span class="green">git clone https://github.com/geodesic-glitch/del-fi.git && cd del-fi</span>
+<span class="dim">  $</span> <span class="green">python3 -m venv venv && . venv/bin/activate</span>
 <span class="dim">  $</span> <span class="green">pip install -r requirements.txt</span>
 <span class="dim">  $</span> <span class="green">cp config.example.yaml config.yaml</span>  <span class="dim"># set node_name and model</span>
 <span class="dim">  $</span> <span class="green">python main.py --build-wiki</span>  <span class="dim"># compile knowledge/ → wiki/</span>
@@ -388,25 +389,25 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
 
 <span class="green">you&gt;</span>  when's trash pickup this week?
 <span class="cyan">node&gt;</span> Trash: Thursday morning, curbside by 7am. Recycling runs the same day. Next bulk item pickup: March 18.
+      <span class="dim">---
+      Del-Fi oracle · 6 pages · !help !topics</span>
 
 <span class="green">you&gt;</span>  is the community well water safe right now?
-<span class="cyan">node&gt;</span> Last test (Feb 28): all coliform and nitrate levels within safe range. Next scheduled test: April 1. Contact county extension if you notice discoloration or odor. <span class="dim">(water-system.md) [!more]</span>
-
-<span class="green">you&gt;</span>  !more
-<span class="cyan">node&gt;</span> If you experience a pressure drop or cloudy water, shut off your service valve and call the water committee emergency line: 555-0173. Do not boil unless a boil order is issued via the neighborhood alert channel. <span class="dim">(water-system.md)</span>
+<span class="cyan">node&gt;</span> Last test (Feb 28): all coliform and nitrate levels within safe range. Next scheduled test: April 1. Contact county extension if you notice discoloration or odor.
+<span class="cyan">node&gt;</span> If you experience a pressure drop or cloudy water, shut off your service valve and call the water committee emergency line: 555-0173. Do not boil unless a boil order is issued via the neighborhood alert channel.
 
 <span class="green">you&gt;</span>  who do i call about a downed tree on county road 4?
-<span class="cyan">node&gt;</span> County road maintenance: 555-0142 (Mon-Fri 7am-5pm). After hours emergencies: sheriff dispatch at 555-0100. Include your cross street and milepost if known. <span class="dim">(local-resources.md)</span>
+<span class="cyan">node&gt;</span> County road maintenance: 555-0142 (Mon-Fri 7am-5pm). After hours emergencies: sheriff dispatch at 555-0100. Include your cross street and milepost if known.
 
 <span class="green">you&gt;</span>  any road closures i should know about?
-<span class="cyan">node&gt;</span> CR-4 bridge posted 10-ton weight limit through spring thaw (est. April 15). Detour via Mill Rd adds ~3 mi. No other active closures on file. <span class="dim">(infrastructure.md)</span>
+<span class="cyan">node&gt;</span> CR-4 bridge posted 10-ton weight limit through spring thaw (est. April 15). Detour via Mill Rd adds ~3 mi. No other active closures on file.
 
 <span class="green">you&gt;</span>  !data
-<span class="cyan">node&gt;</span> air_quality_aqi: 42 good (8 min ago)
-       gate_north: closed (2 min ago)
-       rain_24hr_in: 0.4 in (1 hr ago)
-       road_temp_f: 31 °F (8 min ago)
-       temperature_f: 38 °F (8 min ago)
+<span class="cyan">node&gt;</span> Air Quality: 42 AQI (purpleair, 8m ago)
+      Gate North: closed (gate-sensor, 2m ago)
+      Rainfall Today: 0.4 in (davis-vp2, 1h ago)
+      Road Temp: 31 °F (road-probe, 8m ago)
+      Temperature: 38 °F (davis-vp2, 8m ago)
 </pre>
 </section>
 
@@ -416,18 +417,19 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
 <section class="box box-fixed">
   <span class="box-title blue">ARCHITECTURE</span>
   <pre>
-<span class="dim">[LoRa Radio]</span> &lt;--serial/tcp--&gt; <span class="dim">[Mesh Adapter]</span> &lt;--&gt; <span class="dim">[Router]</span> &lt;--&gt; <span class="dim">[Tier Hierarchy]</span>
+<span class="dim">[LoRa Radio]</span> &lt;--serial/tcp--&gt; <span class="dim">[Mesh Adapter]</span> &lt;--&gt; <span class="dim">[Dispatcher]</span> &lt;--&gt; <span class="dim">[Router]</span>
                                      |               |               |
-                              <span class="dim">(meshtastic</span>    <span class="dim">[Formatter]</span>    Tier 0  <span class="white">FactStore</span>   sensor feed, no LLM
-                               <span class="dim">or meshcore)</span>               Tier 1  <span class="white">WikiEngine</span>  BM25 + LLM on compiled wiki
+                              <span class="dim">(meshtastic)</span>   <span class="dim">rate limit,</span>     Tier 0  <span class="white">FactStore</span>   sensor feed, no LLM
+                                             <span class="dim">queue</span>           Tier 1  <span class="white">WikiEngine</span>  wiki search + best source passages
                                                            Tier 2  <span class="white">PeerCache</span>   trusted peer Q&amp;A
                                                            Tier 3  <span class="white">GossipDir</span>   referrals only
 
-<span class="white">main.py</span> ................. entry point, daemon lifecycle, --build-wiki, --lint-wiki
+<span class="white">main.py</span> ................. entry point: daemon, --simulator, --build-wiki, --lint-wiki, --gui
 <span class="white">del_fi/</span>
   <span class="dim">config.py</span> ............. YAML loading, validation, oracle profiles
   <span class="dim">core/</span>
-    <span class="white">knowledge.py</span> ......... WikiEngine: compile knowledge/ → wiki/, BM25 query, lint
+    <span class="white">dispatcher.py</span> ........ main loop: rate limit, question queue, worker thread
+    <span class="white">knowledge.py</span> ......... WikiEngine: compile knowledge/ → wiki/, passage retrieval, lint
       <span class="dim">knowledge/</span> .......... raw source docs (human-owned, gitignored)
       <span class="dim">wiki/</span> ............... LLM-compiled pages, rebuilt via --build-wiki
     <span class="white">router.py</span> ........... command dispatch, tier routing, !more buffer
@@ -439,8 +441,8 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
     <span class="white">board.py</span> ............ community message board, !post / !board
   <span class="dim">mesh/</span>
     <span class="dim">base.py</span> ............. abstract MeshAdapter interface
-    <span class="dim">meshtastic_adapter.py</span>  Meshtastic radios (serial/TCP/BLE)
-    <span class="dim">meshcore_adapter.py</span>    MeshCore radios (stub -- ready to implement)
+    <span class="dim">meshtastic_adapter.py</span>  Meshtastic radios (serial/TCP/BLE), auto-reconnect
+    <span class="dim">meshcore_adapter.py</span>    MeshCore radios (stub -- not functional yet)
     <span class="dim">simulator.py</span> ........ stdin/stdout for development
 </pre>
 </section>

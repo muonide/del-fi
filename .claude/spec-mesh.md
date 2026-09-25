@@ -8,73 +8,51 @@
 ## 1. MeshAdapter ABC
 
 All radio adapters implement `MeshAdapter` from `del_fi/mesh/base.py`.
+Adapters are deliberately thin: they move text between the radio and the
+`Dispatcher` (`del_fi/core/dispatcher.py`), which owns rate limiting,
+queueing and replies for every protocol.
 
 ```python
-import abc
+class MeshAdapter(ABC):
+    def __init__(self, cfg: dict, msg_queue: queue.Queue): ...
 
-class MeshAdapter(abc.ABC):
+    @abstractmethod
+    def connect(self) -> bool:
+        """Open the radio. Returns True on success; catches its own errors.
+        Safe to call again to reconnect (closes the previous link first)."""
 
-    @abc.abstractmethod
-    def connect(self) -> None:
-        """
-        Establish connection to the radio hardware.
-        Raises: MeshConnectionError on failure.
-        Should be idempotent — calling connect() on an already-connected adapter
-        is a no-op (not an error).
-        """
+    @abstractmethod
+    def send_dm(self, dest_id: str, text: str) -> bool:
+        """Send a direct message. Returns True if handed to the radio.
+        Never raises: failures are logged and reported as False."""
 
-    @abc.abstractmethod
-    def send_dm(self, dest: str, text: str) -> None:
-        """
-        Send a direct message to a node.
-        dest: hardware node ID string (hex, e.g. "!a1b2c3d4")
-        text: UTF-8 string, already formatted and enforced ≤ 230 bytes by Formatter.
-        Raises: MeshSendError on failure (adapter logs and discards — does not crash daemon).
-        """
-
-    @abc.abstractmethod
+    @abstractmethod
     def close(self) -> None:
-        """
-        Disconnect cleanly. Called on daemon shutdown (SIGINT/SIGTERM).
-        Must not raise.
-        """
+        """Release the radio and stop reconnect_loop(). Must not raise."""
+
+    def send_broadcast(self, text: str, channel_index: int = 0) -> bool:
+        """Optional: broadcast on a channel (gossip announcements).
+        Default returns False (unsupported)."""
 
     def reconnect_loop(self) -> None:
-        """
-        Optional. Override to provide background reconnection.
-        Default implementation does nothing.
-        Called from a daemon background thread — must loop indefinitely until
-        daemon shutdown is signalled.
-        """
-        pass
+        """Optional supervisor thread body, started once at daemon startup:
+        keep the link up for the daemon's whole life. Default: no-op."""
 
-    def on_message(self, callback) -> None:
-        """
-        Register the dispatcher callback.
-        callback signature: (sender_id: str, text: str) -> None
-        Must be called before connect(). Adapters call the callback from the
-        listener thread; dispatcher must be thread-safe (uses queue.Queue internally).
-        """
-        self._callback = callback
+    connected: bool        # property: link currently up
+    protocol_name: str     # shown in the banner
 ```
 
-### Exception types
-
-```python
-class MeshConnectionError(Exception): ...
-class MeshSendError(Exception): ...
-```
-
-Both are defined in `del_fi/mesh/base.py`.
+Inbound messages are put on `msg_queue` as `(sender_id, text)`, where
+`sender_id` is protocol-native (`"!a1b2c3d4"` for Meshtastic).
 
 ### Invariants
 
-- The dispatcher callback is always registered before `connect()` is called.
-- `send_dm()` receives text that has already passed through `Formatter`.
-  Adapters must not re-encode, re-format, or truncate the text.
-- Adapters must not call `send_dm()` recursively from the listener callback.
-- Adapter threads must not import from `del_fi/core/` — dependency direction is
-  `core/ → mesh/`, not the reverse.
+- `send_dm()` receives text already formatted to ≤ `max_response_bytes`;
+  oversize text is split defensively, never silently truncated.
+- Adapters never rate-limit or reply on their own — that is the
+  dispatcher's job, so behaviour is identical across protocols.
+- Dependency direction: `mesh/` may import helpers from `core/` (e.g.
+  `formatter.chunk_text`); `core/` never imports `mesh/`.
 
 ---
 
@@ -84,122 +62,67 @@ File: `del_fi/mesh/meshtastic_adapter.py`
 
 ### 2.1 Connection modes
 
-| Mode | Config `mesh_type` | When to use |
-|------|-------------------|-------------|
-| Serial | `meshtastic-serial` | Direct USB/UART connection |
-| TCP | `meshtastic-tcp` | Wi-Fi or networked radio (same LAN) |
-| BLE | `meshtastic-ble` | Bluetooth (slower; use only on hardware with BLE) |
+| `radio_connection` | `radio_port` | When to use |
+|--------------------|--------------|-------------|
+| `serial` | `/dev/ttyUSB0`, `/dev/ttyACM0` | Direct USB/UART connection |
+| `tcp` | `host`, `host:port`, `[ipv6]:port` (default port 4403) | Wi-Fi or networked radio |
+| `ble` | BLE address | Bluetooth (slower) |
 
-Config examples:
+`want_ack` (default `true`) sends DMs with `wantAck`, so the firmware
+retries each chunk across hops until the destination acknowledges it —
+what the Meshtastic apps do for DMs.
 
-```yaml
-mesh_type: meshtastic-serial
-serial_port: /dev/ttyUSB0       # or null for auto-detect
+### 2.2 Receiving
 
-mesh_type: meshtastic-tcp
-tcp_host: 192.168.1.42
-tcp_port: 4403                  # default Meshtastic TCP port
+The adapter subscribes (once) to two meshtastic pub/sub topics:
 
-mesh_type: meshtastic-ble
-ble_address: "AA:BB:CC:DD:EE:FF"  # null for auto-scan
-```
+| Topic | Handler |
+|-------|---------|
+| `meshtastic.receive.text` | `_on_receive(packet, interface)` |
+| `meshtastic.connection.lost` | `_on_connection_lost(interface)` → marks the link down |
 
-### 2.2 Message subscription
+`_on_receive` drops packets with no sender or text, the node's own
+messages, and duplicate packet IDs, then:
 
-The adapter subscribes to Meshtastic's pub/sub interface:
-
-```python
-from meshtastic import portnums_pb2
-from pubsub import pub
-
-pub.subscribe(self._on_receive, "meshtastic.receive.text")
-```
-
-Handler:
-
-```python
-def _on_receive(self, packet, interface):
-    msg_id = packet.get("id")
-    if msg_id in self._seen_ids:
-        return                          # dedup
-    self._seen_ids.add(msg_id)
-    if len(self._seen_ids) > 1000:     # prune
-        self._seen_ids = set(list(self._seen_ids)[-500:])
-
-    decoded = packet.get("decoded", {})
-    text = decoded.get("text", "").strip()
-    sender = packet.get("fromId")
-    
-    if not text or not sender:
-        return
-    
-    # broadcast: log only, do not reply
-    to = packet.get("toId")
-    if to == "^all":
-        log.debug("broadcast from %s (ignored): %s", sender, text[:50])
-        return
-    
-    self._callback(sender, text)
-```
+- **Direct message** → queued for the dispatcher.
+- **Broadcast starting with `DEL-FI:`** → queued (gossip announcement).
+- **Any other broadcast** → ignored (channel chatter is not for us).
 
 ### 2.3 Rate limiting
 
-Freeform queries (not commands) are rate-limited per sender.
-Commands (`!`-prefix) bypass the rate limiter always.
-
-```python
-# per-sender timestamp tracking
-def _is_rate_limited(self, sender: str) -> bool:
-    now = time.monotonic()
-    last = self._rate_timestamps.get(sender, 0.0)
-    if now - last < self._rate_limit_seconds:
-        return True
-    self._rate_timestamps[sender] = now
-    return False
-```
-
-Config key: `rate_limit_seconds` (default: 30). 0 disables rate limiting.
-
-Rate limit response: `"[rate limited — wait {remaining:.0f}s]"`
+Adapters do **not** rate-limit. Rate limiting is protocol-agnostic and lives
+in the `Dispatcher`, so every adapter gets the same behaviour: one question
+per `rate_limit_seconds` per sender, commands exempt (except `!retry`), and
+one "slow down" reply per window instead of a silent drop. See
+`.claude/spec-router.md §5`.
 
 ### 2.4 Message deduplication
 
-Meshtastic may deliver the same packet multiple times (mesh flooding). The adapter
-tracks seen message IDs in a `set`. The set is pruned when it exceeds 1000 entries,
-keeping the most recent 500 (sliding window by insertion order).
+Meshtastic can deliver the same packet more than once (mesh flooding). The
+last 500 packet IDs are kept in a `deque`; repeats are dropped. Packets
+without an ID are never deduplicated. In-memory only.
 
-The dedup set is in-memory only; a daemon restart clears it. Duplicate handling
-across restart is not required.
+### 2.5 Outbound pacing
 
-### 2.5 Outbound inter-chunk delay
+The dispatcher pauses 0.5 s between the chunks of one reply; the radio's
+own transmit queue and duty-cycle limits handle the rest. If `send_dm()`
+is ever handed text over `max_response_bytes`, it splits it and waits 3 s
+between pieces.
 
-When sending multi-chunk responses, insert a delay between chunks to avoid
-flooding the mesh:
+### 2.6 Supervisor (reconnect loop)
 
-```python
-INTER_CHUNK_DELAY_SECONDS = 3.0
+`main.py` always starts `reconnect_loop()` in a thread for real radios —
+not only when the first `connect()` fails — so a radio that drops later
+(USB unplugged, TCP reset, radio reboot) comes back on its own:
+
+```
+while not stopped:
+    if connected: wait 5 s; continue
+    connect()  (closes the old interface first)
+    on failure: wait 10 s, doubling to at most 120 s
 ```
 
-Config key: `chunk_delay_seconds` (default: 3.0). Minimum enforced: 1.0 second.
-
-### 2.6 Reconnect loop
-
-The `reconnect_loop()` implementation for Meshtastic:
-
-```python
-def reconnect_loop(self) -> None:
-    while not self._shutdown.is_set():
-        if not self._connected:
-            try:
-                self.connect()
-            except MeshConnectionError as e:
-                log.warning("Reconnect failed: %s. Retrying in 30s.", e)
-                self._shutdown.wait(30)
-        else:
-            self._shutdown.wait(5)   # poll health every 5s
-```
-
-A `threading.Event` (`self._shutdown`) is set on `close()` to exit the loop.
+`close()` sets the stop event, unsubscribes and closes the interface.
 
 ---
 
@@ -295,35 +218,33 @@ echo "!test1> what is the current temperature?" | python main.py --simulator
 
 ## 5. Adapter Registration
 
-The active adapter is resolved from the `mesh_type` config key at startup:
+The adapter is chosen by the `mesh_protocol` config key (`meshtastic` or
+`meshcore`) through the registry in `del_fi/mesh/__init__.py`:
 
 ```python
-# del_fi/config.py
-MESH_ADAPTERS = {
-    "meshtastic-serial": "del_fi.mesh.meshtastic_adapter.MeshtasticAdapter",
-    "meshtastic-tcp":    "del_fi.mesh.meshtastic_adapter.MeshtasticAdapter",
-    "meshtastic-ble":    "del_fi.mesh.meshtastic_adapter.MeshtasticAdapter",
-    "meshcore":          "del_fi.mesh.meshcore_adapter.MeshCoreAdapter",
-    "simulator":         "del_fi.mesh.simulator.SimulatorAdapter",
+ADAPTERS: dict[str, type[MeshAdapter]] = {
+    "meshtastic": MeshtasticAdapter,   # radio_connection: serial | tcp | ble
+    "meshcore": MeshCoreAdapter,       # stub
 }
 ```
 
-When `--simulator` CLI flag is given, the adapter is forced to `simulator`
-regardless of `mesh_type` config.
+`--simulator` forces `SimulatorAdapter` regardless of `mesh_protocol`.
 
 ---
 
 ## 6. Adding a New Adapter
 
 1. Create `del_fi/mesh/<name>_adapter.py`.
-2. Subclass `MeshAdapter`, implement `connect()`, `send_dm()`, `close()`.
-3. Optionally implement `reconnect_loop()`.
-4. Register in `config.py → MESH_ADAPTERS`.
-5. Add tests in `tests/test_mesh.py` covering:
-   - Successful `connect()` and `close()`.
-   - `send_dm()` delivers text to the correct destination.
-   - Rate limiting: a freeform query is blocked after threshold; command is not.
-   - Deduplication: duplicate message ID is not forwarded to callback.
+2. Subclass `MeshAdapter`; implement `connect()`, `send_dm()`, `close()`.
+3. Implement `reconnect_loop()` so a dropped link recovers, and
+   `send_broadcast()` if the protocol can broadcast (gossip).
+4. Register it in `ADAPTERS` and add its name to `SUPPORTED_PROTOCOLS`
+   in `del_fi/config.py`.
+5. Put the hardware and library calls behind small methods (like
+   `MeshtasticAdapter._open_interface` / `_subscribe`) so tests can
+   replace them, and add tests in `tests/test_mesh.py` covering: connect
+   and reconnect, `send_dm()` to the right destination, deduplication,
+   and which broadcasts are forwarded.
 
 ---
 

@@ -5,33 +5,69 @@ managing a Del-Fi oracle deployment.
 
 Launch via:
     python main.py --gui [--config PATH] [--gui-port 5174]
+
+Security: the server binds to 127.0.0.1 only. Every request must carry a
+loopback Host header (defeats DNS rebinding), and state-changing requests
+must be JSON from a same-origin page (defeats cross-site requests from
+other tabs in the operator's browser).
 """
 
 import json
 import logging
 import os
-import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
-log = logging.getLogger("del_fi.gui")
+from del_fi import __version__
+from del_fi.config import ConfigError, read_config
+from del_fi.core.fsutil import write_atomic
 
-VERSION = "0.2"
+log = logging.getLogger("del_fi.gui")
 
 # Project root is three levels up: del_fi/gui/server.py → del_fi/gui → del_fi → project root
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+_MAX_SIM_TEXT = 500
+_MAX_BUILD_OUTPUT = 20000
 
-def create_app(cfg: dict, config_path: str):
+
+def allowed_hosts(port: int) -> set[str]:
+    """Host header values the GUI accepts: loopback names, with or without port."""
+    return {h for name in _LOOPBACK_NAMES for h in (name, f"{name}:{port}")}
+
+
+def simulator_config(cfg: dict) -> dict:
+    """Config for the GUI's chat simulator: same knowledge, sandboxed state.
+
+    Answers come from the real wiki, but the simulator's response cache,
+    board, memory and seen-senders live under cache/gui-simulator/, so
+    testing from the GUI never leaks into what radio users receive.
+    """
+    sim = dict(cfg)
+    sim_dir = os.path.join(cfg["_cache_dir"], "gui-simulator")
+    sim["_cache_dir"] = sim_dir
+    sim["_gossip_dir"] = os.path.join(sim_dir, "gossip")
+    sim["_seen_senders_file"] = os.path.join(sim_dir, "seen_senders.txt")
+    sim["fact_feed_file"] = cfg.get("fact_feed_file") or os.path.join(
+        cfg["_cache_dir"], "sensor_feed.json"
+    )
+    sim["wiki_watch_enabled"] = False
+    return sim
+
+
+def create_app(cfg: dict, config_path: str, port: int = 5174):
     """Build and return the Flask application."""
     try:
-        from flask import Flask, jsonify, render_template, request
+        from flask import Flask, abort, jsonify, render_template, request
     except ImportError:
         print(
             "\n[del-fi] flask is required for --gui.\n"
@@ -43,6 +79,7 @@ def create_app(cfg: dict, config_path: str):
     template_dir = str(Path(__file__).parent / "templates")
     app = Flask(__name__, template_folder=template_dir)
     app.config["JSON_SORT_KEYS"] = False
+    hosts = allowed_hosts(port)
 
     _state: dict = {
         "cfg": cfg,
@@ -52,6 +89,25 @@ def create_app(cfg: dict, config_path: str):
         "_router_lock": threading.Lock(),
         "_router_stale": False,
     }
+    _build: dict = {"proc": None, "output": "", "started": 0.0, "returncode": None}
+    _build_lock = threading.Lock()
+
+    # ── Request guard ─────────────────────────────────────────────────────
+
+    @app.before_request
+    def _guard():
+        if request.host not in hosts:
+            abort(403)  # DNS rebinding: another domain resolving to 127.0.0.1
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        origin = request.headers.get("Origin")
+        if origin and urlparse(origin).netloc not in hosts:
+            abort(403)
+        if not request.is_json:
+            # A JSON body forces a CORS preflight from any other origin,
+            # which this server never approves.
+            abort(415)
+        return None
 
     # ── Lazy Router for Simulator ──────────────────────────────────────────
 
@@ -62,27 +118,27 @@ def create_app(cfg: dict, config_path: str):
                 from del_fi.core.knowledge import WikiEngine
                 from del_fi.core.peers import GossipDirectory, PeerCache
                 from del_fi.core.router import Router
-                c = _state["cfg"]
+                c = simulator_config(_state["cfg"])
                 for d in (c["_cache_dir"], c["_gossip_dir"], c["wiki_folder"]):
                     os.makedirs(d, exist_ok=True)
-                wiki = WikiEngine(c)
+                facts = FactStore(c)
+                facts._poll_feed_file()
                 _state["_router"] = Router(
-                    c, wiki, PeerCache(c), GossipDirectory(c),
-                    fact_store=FactStore(c),
+                    c, WikiEngine(c), PeerCache(c), GossipDirectory(c), fact_store=facts,
                 )
                 _state["_router_stale"] = False
         return _state["_router"]
 
     # ── Helper: run main.py subcommand ────────────────────────────────────
 
+    def _main_cmd(*args) -> list[str]:
+        return [sys.executable, str(_PROJECT_ROOT / "main.py"), *args,
+                "--config", _state["config_path"]]
+
     def _run_main(*args, timeout: int = 30) -> dict:
-        main_py = _PROJECT_ROOT / "main.py"
-        if not main_py.exists():
-            return {"ok": False, "error": f"main.py not found at {main_py}"}
         try:
             r = subprocess.run(
-                [sys.executable, str(main_py), *args,
-                 "--config", _state["config_path"]],
+                _main_cmd(*args),
                 capture_output=True, text=True, timeout=timeout,
                 cwd=str(_PROJECT_ROOT),
             )
@@ -96,6 +152,14 @@ def create_app(cfg: dict, config_path: str):
             return {"ok": False, "error": "timed out"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def _collect_build_output(proc: subprocess.Popen):
+        for line in proc.stdout:
+            with _build_lock:
+                _build["output"] = (_build["output"] + line)[-_MAX_BUILD_OUTPUT:]
+        proc.wait()
+        with _build_lock:
+            _build["returncode"] = proc.returncode
 
     # ── Routes ────────────────────────────────────────────────────────────
 
@@ -144,7 +208,7 @@ def create_app(cfg: dict, config_path: str):
             "wiki_folder": str(wiki_dir),
             "knowledge_folder": str(knowledge_dir),
             "uptime_s": int(time.time() - _state["start_time"]),
-            "version": VERSION,
+            "version": __version__,
             "config_path": _state["config_path"],
         })
 
@@ -153,7 +217,7 @@ def create_app(cfg: dict, config_path: str):
         try:
             with open(_state["config_path"], "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
-            return jsonify({"ok": True, "config": raw})
+            return jsonify({"ok": True, "config": raw if isinstance(raw, dict) else {}})
         except FileNotFoundError:
             return jsonify({"ok": True, "config": {}})
         except Exception as e:
@@ -161,30 +225,67 @@ def create_app(cfg: dict, config_path: str):
 
     @app.route("/api/config", methods=["POST"])
     def api_config_post():
+        """Merge the form's values into config.yaml, validate, then save.
+
+        Keys the form manages are replaced (or removed when cleared); every
+        other key in the file — mesh_knowledge, meshcore, board filters — is
+        kept. The previous file is saved as config.yaml.bak. Nothing is
+        written unless the result passes the same validation as the daemon.
+        """
+        body = request.get_json(silent=True) or {}
+        posted = body.get("config")
+        if not isinstance(posted, dict):
+            return jsonify({"ok": False, "error": "request needs a config object"}), 400
+        managed = body.get("managed_keys")
+        managed = {str(k) for k in managed} if isinstance(managed, list) else set(posted)
+        posted = {str(k): v for k, v in posted.items() if not str(k).startswith("_")}
+        if not str(posted.get("node_name", "")).strip():
+            return jsonify({"ok": False, "error": "node_name is required"}), 400
+        if not str(posted.get("model", "")).strip():
+            return jsonify({"ok": False, "error": "model is required"}), 400
+
+        path = Path(_state["config_path"])
+        current: dict = {}
+        if path.exists():
+            try:
+                loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                current = loaded if isinstance(loaded, dict) else {}
+            except yaml.YAMLError:
+                current = {}  # unreadable: replaced, but kept in the .bak
+        merged = {k: v for k, v in current.items() if k not in managed}
+        merged.update(posted)
+        text = yaml.safe_dump(
+            merged, default_flow_style=False, allow_unicode=True, sort_keys=False, width=80,
+        )
+
+        # Validate a copy next to the real file, so relative paths resolve
+        # exactly as they will for the daemon.
+        check = path.with_name(f".{path.name}.gui-check")
         try:
-            body = request.get_json(force=True)
-            new_cfg = body.get("config", {})
-            # Strip internal runtime keys
-            clean = {k: v for k, v in new_cfg.items() if not k.startswith("_")}
-            if not str(clean.get("node_name", "")).strip():
-                return jsonify({"ok": False, "error": "node_name is required"}), 400
-            if not str(clean.get("model", "")).strip():
-                return jsonify({"ok": False, "error": "model is required"}), 400
-            with open(_state["config_path"], "w", encoding="utf-8") as f:
-                yaml.dump(
-                    clean, f, default_flow_style=False,
-                    allow_unicode=True, sort_keys=False, width=80,
-                )
-            from del_fi.config import load_config
-            _state["cfg"] = load_config(_state["config_path"])
-            _state["_router_stale"] = True
-            return jsonify({"ok": True})
-        except Exception as e:
-            log.exception("config save error")
-            return jsonify({"ok": False, "error": str(e)}), 500
+            check.write_text(text, encoding="utf-8")
+            new_cfg = read_config(str(check))
+        except ConfigError as e:
+            return jsonify({"ok": False, "error": str(e).replace(str(check), str(path))}), 400
+        finally:
+            try:
+                check.unlink()
+            except OSError:
+                pass
+
+        backup = None
+        if path.exists():
+            backup = path.with_name(path.name + ".bak")
+            shutil.copy2(path, backup)
+        if not write_atomic(str(path), text):
+            return jsonify({"ok": False, "error": f"could not write {path}"}), 500
+        new_cfg["_config_path"] = str(path.resolve())
+        _state["cfg"] = new_cfg
+        _state["_router_stale"] = True
+        return jsonify({"ok": True, "backup": str(backup) if backup else None})
 
     @app.route("/api/wiki/pages")
     def api_wiki_pages():
+        import re
         wiki_dir = Path(_state["cfg"]["wiki_folder"])
         pages = []
         if wiki_dir.exists():
@@ -215,6 +316,7 @@ def create_app(cfg: dict, config_path: str):
 
     @app.route("/api/wiki/page/<slug>")
     def api_wiki_page(slug: str):
+        import re
         slug = re.sub(r"[^a-zA-Z0-9_-]", "", slug)
         page_path = Path(_state["cfg"]["wiki_folder"]) / f"{slug}.md"
         if not page_path.exists():
@@ -233,9 +335,39 @@ def create_app(cfg: dict, config_path: str):
 
     @app.route("/api/wiki/build", methods=["POST"])
     def api_wiki_build():
-        timeout = int(_state["cfg"].get("wiki_build_timeout", 600)) + 30
-        result = _run_main("--build-wiki", timeout=timeout)
-        return jsonify(result)
+        """Start --build-wiki in the background; poll /api/wiki/build/status.
+
+        A build can take many minutes with a large model, far longer than a
+        request should stay open, and a timed-out request used to kill it.
+        """
+        with _build_lock:
+            if _build["proc"] is not None and _build["returncode"] is None:
+                return jsonify({"ok": True, "running": True, "already_running": True})
+            try:
+                proc = subprocess.Popen(
+                    _main_cmd("--build-wiki"),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=str(_PROJECT_ROOT),
+                )
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            _build.update(proc=proc, output="", started=time.time(), returncode=None)
+        threading.Thread(target=_collect_build_output, args=(proc,), daemon=True).start()
+        return jsonify({"ok": True, "running": True})
+
+    @app.route("/api/wiki/build/status")
+    def api_wiki_build_status():
+        with _build_lock:
+            started = _build["proc"] is not None
+            running = started and _build["returncode"] is None
+            return jsonify({
+                "ok": True,
+                "started": started,
+                "running": running,
+                "returncode": _build["returncode"],
+                "output": _build["output"],
+                "elapsed_s": int(time.time() - _build["started"]) if started else 0,
+            })
 
     @app.route("/api/wiki/lint", methods=["POST"])
     def api_wiki_lint():
@@ -258,9 +390,9 @@ def create_app(cfg: dict, config_path: str):
 
     @app.route("/api/simulate", methods=["POST"])
     def api_simulate():
-        body = request.get_json(force=True)
-        sender = str(body.get("sender", "!gui00000")).strip()[:20]
-        text = str(body.get("text", "")).strip()
+        body = request.get_json(silent=True) or {}
+        sender = str(body.get("sender", "!gui00000")).strip()[:20] or "!gui00000"
+        text = str(body.get("text", "")).strip()[:_MAX_SIM_TEXT]
         if not text:
             return jsonify({"ok": False, "error": "empty message"}), 400
         try:
@@ -273,16 +405,33 @@ def create_app(cfg: dict, config_path: str):
 
     @app.route("/api/board")
     def api_board():
+        """The live board (read-only; the simulator's board is sandboxed)."""
         board_path = Path(_state["cfg"]["_cache_dir"]) / "board.json"
         if not board_path.exists():
             return jsonify({"ok": True, "posts": []})
         try:
-            return jsonify({
-                "ok": True,
-                "posts": json.loads(board_path.read_text(encoding="utf-8")),
-            })
+            data = json.loads(board_path.read_text(encoding="utf-8"))
+            posts = data.get("posts", []) if isinstance(data, dict) else []
+            return jsonify({"ok": True, "posts": [p for p in posts if isinstance(p, dict)]})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/board/post", methods=["POST"])
+    def api_board_post():
+        """Post to the live board as the operator (same rules as !post)."""
+        from del_fi.core.board import Board
+        c = _state["cfg"]
+        if not c.get("board_enabled"):
+            return jsonify({"ok": False, "error": "The board is off (set board_enabled: true)."}), 400
+        body = request.get_json(silent=True) or {}
+        sender = str(body.get("sender") or "!gui00000").strip()[:20] or "!gui00000"
+        text = str(body.get("text", ""))
+        with _state["_router_lock"]:
+            board = _state.get("_live_board")
+            if board is None or _state.get("_live_board_cfg") is not c:
+                board = Board(c)
+                _state["_live_board"], _state["_live_board_cfg"] = board, c
+        return jsonify({"ok": True, "result": board.post(sender, text)})
 
     @app.route("/api/logs")
     def api_logs():
@@ -290,7 +439,8 @@ def create_app(cfg: dict, config_path: str):
             n = min(max(int(request.args.get("lines", 100)), 10), 500)
         except ValueError:
             n = 100
-        log_path = Path(_state["cfg"].get("_config_dir", ".")) / "del_fi.log"
+        c = _state["cfg"]
+        log_path = Path(c.get("log_file") or os.path.join(c.get("_config_dir", "."), "del_fi.log"))
         if not log_path.exists():
             return jsonify({"ok": True, "lines": [], "file": str(log_path)})
         try:
@@ -308,9 +458,9 @@ def create_app(cfg: dict, config_path: str):
 
 def launch(cfg: dict, config_path: str, port: int = 5174, open_browser: bool = True):
     """Start the GUI server and optionally open the browser."""
-    app = create_app(cfg, config_path)
+    app = create_app(cfg, config_path, port=port)
     url = f"http://127.0.0.1:{port}"
-    print(f"\n  ·· DEL-FI GUI ··  {url}\n  Ctrl+C to stop\n")
+    print(f"\n  ·· DEL-FI GUI ··  {url}\n  config: {config_path}\n  Ctrl+C to stop\n")
     log.info(f"GUI server at {url}")
 
     if open_browser:

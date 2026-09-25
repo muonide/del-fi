@@ -24,8 +24,8 @@ A wilderness observatory oracle for Ridgeline Station, a remote field research s
 ## Suggested config.yaml
 
 ```yaml
+# Wilderness observatory oracle at 9,240 ft: wildlife, weather, trails, field science.
 node_name: "RIDGELINE"
-node_description: "Wilderness observatory oracle at 9,240 ft. Wildlife, weather, trails, and field science for Ridgeline Station."
 oracle_type: "observatory"
 
 model: "gemma4:4b"
@@ -34,23 +34,26 @@ wiki_builder_model: "gemma4:12b"
 knowledge_folder: ./knowledge
 wiki_folder: ./wiki
 
-# These files change frequently — wiki pages get age headers at query time
+# These files change frequently — their passages get age headers at query time
 time_sensitive_files:
   - weather-station.md
   - trail-camera-log.md
 
 wiki_stale_after_days: 7    # field station data goes stale quickly
 
-# Watch for changes and patch wiki incrementally with serving model
+# Recompile changed files (with the serving model) and drop deleted ones
 wiki_watch_enabled: true
-wiki_patch_threshold_pct: 40
 
 fallback_message: "No data on that. Try !topics or !data for current sensor readings."
 welcome_footer: "RIDGELINE — ask about wildlife, weather, trails, and field conditions."
 
-trusted_peers:
-  - "VALLEY-ORACLE"
-  - "SUMMIT-POST"
+# Hear VALLEY-ORACLE and SUMMIT-POST on the mesh and refer questions to them
+mesh_knowledge:
+  gossip:
+    enabled: true
+  # peers:                     # trust by hardware node ID, exchanged in person
+  #   - node_id: "!a1b2c3d4"
+  #     name: "VALLEY-ORACLE"
 
 # Tier 0 fast path — answer directly from sensor_feed.json for these queries
 fact_query_keywords:
@@ -68,7 +71,7 @@ fact_query_keywords:
   - pressure
   - barometer
 
-mesh_adapter: meshtastic
+mesh_protocol: meshtastic
 
 personality: >
   You are RIDGELINE, a field science oracle at a remote wilderness observatory.
@@ -94,12 +97,12 @@ personality: >
 
 **Weather station updates** (daily, via sensor feed):
 - The Tier 0 FactStore reads `cache/sensor_feed.json` directly — no wiki rebuild needed for live sensor data.
-- Update `weather-station.md` weekly with the 7-day log summary; `watch()` will `patch()` the wiki automatically.
+- Update `weather-station.md` weekly with the 7-day log summary; the wiki watcher recompiles its page automatically.
 
 **Camera log updates** (after each monthly SD card check):
 1. Append new entries to the top of `trail-camera-log.md`
-2. The `watch()` thread detects the change and calls `patch()` using the serving model
-3. For large batches (many new entries), run `--build-wiki` for a full re-synthesis
+2. The wiki watcher notices the change within a minute and recompiles that page with the serving model (or `wiki_patch_model`)
+3. For large batches (many new entries), run `--build-wiki` to recompile with the larger `wiki_builder_model`
 
 **Before deployment or after major updates**:
 ```bash
@@ -134,7 +137,7 @@ RIDGELINE has no internet access. All communication is via Meshtastic mesh. VALL
 
 To use this template for a different field station:
 1. Replace knowledge files with content relevant to your location and species
-2. Update `node_name` and `node_description`
+2. Update `node_name` and `personality`
 3. Update `fact_query_keywords` to match your sensor data
 4. Update `time_sensitive_files` to match which files change most often
 5. Set `wiki_stale_after_days` to match your update cadence (7 is aggressive; use 14–30 for less-active stations)

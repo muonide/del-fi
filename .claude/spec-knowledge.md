@@ -40,106 +40,40 @@ context string assembled → Ollama generation → response
 
 ## 2. WikiEngine Class Interface
 
+`del_fi/core/knowledge.py`. Ollama is reached through the `ollama` Python
+client; tests substitute a fake client object (see `tests/test_knowledge.py`).
+
 ```python
 class WikiEngine:
-    def __init__(self, config: dict, ollama_client: OllamaClient) -> None:
-        """
-        config keys used:
-          wiki_folder, knowledge_folder, model, wiki_builder_model,
-          similarity_threshold, rag_top_k, max_context_tokens,
-          small_model_prompt, time_sensitive_files, wiki_stale_after_days
-        """
+    def __init__(self, cfg: dict) -> None: ...
 
-    def build(self, file_path: str | None = None) -> dict:
-        """
-        Run --build-wiki pipeline. Uses wiki_builder_model (large, high-quality synthesis).
-        If file_path is given, rebuild only that source file's wiki pages.
-        Returns summary: {"pages_updated": int, "pages_created": int, "errors": list}
+    def build(self, file: str | None = None, model: str | None = None) -> int:
+        """Compile knowledge/ → wiki/. Returns pages written.
+        file: rebuild only that source. model: overrides wiki_builder_model
+        (the watcher passes wiki_patch_model or the serving model).
+        A full build first prunes pages whose source was deleted."""
 
-        Use this for: initial deployment build, periodic full re-synthesis,
-        manual rebuild after structural changes to knowledge/ files.
-        """
+    def prune_removed_sources(self) -> list[str]:
+        """Remove pages (and index rows, embeddings) whose tracked source file
+        is gone. Never prunes while knowledge/ is empty."""
 
-    def patch(self, file_path: str) -> dict:
-        """
-        Apply an incremental update to the wiki page for the given source file.
-        Uses the serving model (model config key, small/edge model) — NOT wiki_builder_model.
+    def query(self, q, peer_ctx="", history="", board_context="") -> tuple[str, bool]:
+        """(answer, had_context). had_context=False → no page matched or the
+        model declined (IDK). Raises LLMError when generation fails."""
 
-        The patch is constrained: provide (existing wiki page + changed content),
-        ask the small model to add/update only the changed facts without restructuring
-        the page. The foundation built by build() is preserved.
+    def lint(self) -> list[str]: ...
+    def watch(self, interval: int, stop: threading.Event) -> None: ...
+    def num_ctx(self) -> int: ...          # context window sent with answers
+    def get_topics(self) -> list[str]: ...
+    def suggest(self, query: str) -> str: ...
 
-        Called by watch() when a source file changes.
-        NOT used for initial builds or peer-sourced content.
+    available: bool        # Ollama reachable
+    rag_available: bool    # ChromaDB usable
+    wiki_available: bool   # wiki/index.md exists and is non-empty
+    page_count: int
 
-        Returns summary: {"page": str, "action": "updated"|"rebuilt", "error": str|None}
-        If the patch fails (model error, parse failure), falls back to build(file_path).
-        """
-
-    def query(
-        self,
-        q: str,
-        peer_context: str = "",
-        history: str = "",
-    ) -> tuple[str, str]:
-        """
-        Query the compiled wiki.
-        Returns (answer, source_label) where source_label may be empty.
-        source_label example: "wildlife-guide, weather-station"
-        """
-
-    def lint(self) -> list[str]:
-        """
-        Lint the wiki for: orphan pages, missing cross-refs,
-        stale pages, data gaps. Returns list of issue strings.
-        """
-
-    def watch(self, interval: int = 60) -> None:
-        """
-        Background thread. Polls knowledge/ folder for file changes.
-        On change: calls self.patch(changed_file) — uses small serving model.
-        Only calls self.build(changed_file) as a fallback if patch() fails.
-        Runs until daemon shutdown.
-        """
-
-    def _bm25_search(self, query: str, top_k: int = 5) -> list[str]:
-        """
-        Keyword search over wiki/index.md titles and tags.
-        Returns list of wiki page filenames, ranked by match score.
-        """
-
-    def _vector_search(self, query: str, top_k: int = 3) -> list[str]:
-        """
-        ChromaDB cosine similarity search over embedded wiki pages.
-        Returns list of wiki page filenames, ranked by similarity.
-        """
-
-    def _read_wiki_page(self, filename: str) -> tuple[dict, str]:
-        """
-        Read a wiki page. Returns (frontmatter_dict, body_text).
-        Raises FileNotFoundError if page does not exist in wiki/.
-        """
-
-    def _write_wiki_page(self, filename: str, frontmatter: dict, body: str) -> None:
-        """Write a wiki page atomically (write to .tmp, then rename)."""
-
-    def _update_index(self, filename: str, frontmatter: dict, body: str) -> None:
-        """Update wiki/index.md row for the given page."""
-
-    def _append_log(self, entry: str) -> None:
-        """Append an entry to wiki/log.md."""
-```
-
-### 2.1 OllamaClient wrapper
-
-The `WikiEngine` should not call `requests` directly. Use a thin wrapper that
-the test suite can mock:
-
-```python
-class OllamaClient:
-    def generate(self, model: str, prompt: str, system: str = "") -> str: ...
-    def embed(self, model: str, text: str) -> list[float]: ...
-    def is_available(self) -> bool: ...
+class LLMError(Exception):
+    kind: str              # "unavailable" | "timeout" | "error"
 ```
 
 ---
@@ -247,20 +181,28 @@ The build command does **not** start the radio listener. It is a batch job.
 ### 6.2 Per-file processing
 
 ```
-for each file in knowledge/ (sorted by mtime, oldest first):
-    compute MD5 hash
-    if hash matches wiki/.<filename>.hash: skip (unchanged)
-    
-    prompt = build_prompt(source_content, existing_wiki_pages)
-    wiki_pages = wiki_builder_model.generate(prompt)
-    
-    for each wiki_page in wiki_pages:
-        merge_into_wiki(wiki_page)
-        update_index(wiki_page)
-    
-    write wiki/.<filename>.hash
-    append_log(entry)
+full build: prune pages whose tracked source was deleted (see §6.6)
+for each .md/.txt file in knowledge/ (sorted, dotfiles skipped):
+    md5(content) == wiki/.hash_cache.json[filename]  →  skip (unchanged)
+    prompt = WIKI_BUILD_PROMPT(first 12,000 chars of the source)
+    page = builder_model.generate(prompt, num_ctx=8192)
+        retry with a larger num_predict while done_reason == "length"
+    strip a ```markdown fence; force frontmatter sources: [<filename>]
+        and last_ingested: <today>, whatever the model wrote
+    write wiki/<slug>.md, update its index.md row, append to log.md
+    record the hash (only now, so a failure anywhere above is retried)
 ```
+
+- Hash cache keys are **filenames**, not absolute paths, so a wiki built on a
+  desktop and copied to the node is not rebuilt there. v0.2 absolute-path
+  keys are migrated on load.
+- Slug = kebab-cased filename stem. `notes.txt` next to `notes.md` gets
+  `notes-txt` so the two do not overwrite each other.
+- Sources longer than 12,000 chars are indexed only up to that point (a
+  warning is logged); answers still read the whole file (§7).
+- The index row is replaced with a function, not a template string, so
+  backslashes in LLM-written tags cannot break `re.sub`; `|` in cells
+  becomes `/`.
 
 ### 6.3 Build prompt
 
@@ -302,12 +244,21 @@ Filename: {filename}
 
 ### 6.4 Atomic writes
 
-Wiki page writes are atomic: write to `wiki/<page>.md.tmp`, then rename to
-`wiki/<page>.md`. This prevents partial wiki pages if the build is interrupted.
+Wiki pages, `index.md` and `.hash_cache.json` are written with
+`fsutil.write_atomic()`: a temp file unique to the process and thread,
+fsync, then rename. An interrupted build never leaves a partial file.
 
 ### 6.5 No network during build
 
 The build uses Ollama (local). It does not call any external service.
+
+### 6.6 Deleted sources
+
+When a source file that the wiki was built from disappears from
+`knowledge/`, the next full build (or watcher cycle) deletes its wiki page,
+index row and embedding, and logs `prune | <file>` to `log.md` — unless the
+page lists another source that still exists. If `knowledge/` is empty,
+nothing is pruned: a node may legitimately run from a deployed `wiki/` alone.
 
 ---
 
@@ -316,62 +267,58 @@ The build uses Ollama (local). It does not call any external service.
 ### 7.1 Full sequence
 
 ```
-1. Normalise query: lowercase, strip punctuation, remove stop words.
+1. Find pages (first strategy that returns anything):
+   a. BM25 over wiki/index.md rows (slug + summary + tags)
+   b. ChromaDB similarity over page embeddings (≥ similarity_threshold)
+   c. whole-word counts over wiki page bodies
+   Keep the top 3 pages.
 
-2. BM25 keyword search on wiki/index.md:
-   - Split into terms.
-   - Score each row by term frequency in (Page title + Summary + Tags).
-   - Return top_k (default 5) page filenames.
+2. Split each page's source files (sources: frontmatter, resolved by
+   basename inside knowledge/ only) into passages: one markdown section
+   each, ≈700 chars max, with the section heading repeated on every cut.
+   If a page's sources are not on this node, split the wiki page itself.
 
-3. Vector search (ChromaDB, optional):
-   - Embed query with nomic-embed-text via Ollama.
-   - Query ChromaDB for top rag_top_k pages by cosine similarity.
-   - If max similarity < similarity_threshold: vector results discarded.
+3. Score every passage against the question with BM25, weighted by page
+   rank (1.0, 0.8, 0.65). Add passages best-first while they fit the
+   budget. If no passage shares a word with the question (a semantic
+   match), take the top page from its start instead.
 
-4. Merge results:
-   - BM25 results (required, high confidence in intent).
-   - Vector results (optional, semantic fallback for paraphrase queries).
-   - Deduplicate. Cap total context pages at max 3.
+4. Output passages grouped by page, in document order, each page headed
+   [slug] — or [slug — last updated 3 hrs ago] for time_sensitive_files.
 
-5. Read wiki pages:
-   - For each page: read body, prepend staleness header if applicable.
-
-6. Assemble context string:
-   - Context is: join(page bodies, separator="\n\n---\n\n").
-   - Cap at max_context_tokens if needed (truncate oldest pages first).
-
-7. Generate with serving model (model config key):
-   - System prompt includes oracle persona, 230-byte guidance.
-   - Context prepended to user query.
-   - See §7.2 for small_model_prompt variant.
-
-8. Return (answer, source_label).
+5. Generate with the serving model; return (answer, had_context).
 ```
 
-### 7.2 System prompt (standard)
+### 7.2 Context budget and num_ctx
 
-```
-You are {node_name}, a field AI assistant serving {oracle_type} over mesh radio.
-Answer questions using ONLY the provided context.
-If the context doesn't contain the answer, say exactly: "I don't have data on that."
-Keep your response under 230 characters. Be direct. Cite dates and numbers from the context.
-```
+| Setting | Meaning |
+|---------|---------|
+| `max_context_tokens` | Retrieved-passage budget (default 1500 tokens ≈ 6000 chars; 1B/2B profiles 512) |
+| `num_ctx` | Context window sent to Ollama. Unset → derived once from the budget: `(max_context_tokens + 1024 + num_predict) × 1.15`, rounded up to 512, min 2048 (3584 by default) |
 
-### 7.3 System prompt (small_model_prompt: true)
+The passage budget also shrinks by the size of history, board posts and peer
+data, so the whole prompt fits the window. num_ctx is **fixed for the life
+of the process**: a value that changes between requests makes Ollama reload
+the model. Builds use their own fixed window (8192).
 
-Used when oracle profile sets `small_model_prompt: true` (sub-2B models).
-Shorter system prompt to preserve token budget:
+### 7.3 System prompts
 
-```
-You are {node_name}. Use ONLY the context below. Answer in 1-2 sentences.
-If not in context, say "No data." Max 230 characters.
-```
+Standard and small-model (`small_model_prompt: true`) variants both say:
+answer ONLY from the excerpts; if they don't directly answer, share the
+closest relevant information and say what topic they cover; never state
+facts not in them. The small variant also caps answers at 1–3 sentences.
+
+A reply is treated as a refusal (→ `had_context=False`, next tier) only if
+it is ≤180 chars and its **first sentence** contains an "I don't know"
+phrase without "but" — so "The trail is 3 mi. I'm not sure about ice." is
+kept as an answer.
 
 ### 7.4 Context reordering
 
-When `reorder_context: true` (oracle profile), put the most-relevant page
-**last** in the context window. Small models suffer from the lost-in-the-middle
-problem; they attend better to the end of context.
+When `reorder_context: true` (1B/2B profiles), pages are output in reverse
+rank order so the most relevant one sits next to the question. Small
+models attend better to the end of the context. Reordering happens after
+passage selection, so it cannot exceed the budget.
 
 ---
 
@@ -415,18 +362,12 @@ The daemon does not crash.
 | Config key | Default | Purpose |
 |------------|---------|---------|
 | `wiki_stale_after_days` | 30 | `--lint-wiki` stale page threshold |
-| `time_sensitive_files` | `[]` | Source filenames that get age annotations at query time |
+| `time_sensitive_files` | `[]` in examples | Source filenames whose pages get an age header at query time |
 
-`time_sensitive_files` example:
-
-```yaml
-time_sensitive_files:
-  - weather-station.md
-  - trail-camera-log.md
-```
-
-When these source files have produced wiki pages, those pages get the inline
-age annotation in the context string (see §3.4).
+For those pages the context header reads `[weather-station — last updated
+3 hrs ago]`, computed from the newest source file's modification time (the
+data's real age), or `ingested Nd ago` from `last_ingested` when the source
+is not on this node.
 
 ---
 
@@ -438,15 +379,13 @@ Runs as: `python main.py --lint-wiki`. Does not start the radio listener.
 
 | Check | Description |
 |-------|-------------|
-| Orphan pages | Wiki pages with no incoming `[[wikilinks]]` from any other page |
-| Missing cross-refs | A page mentions an entity that matches another page title but has no `[[link]]` to it |
-| Stale pages | `last_ingested` older than `wiki_stale_after_days` |
-| Missing source | `sources:` frontmatter lists a file not in `knowledge/` |
-| Empty tags | `tags:` list is empty |
-| Index drift | A wiki page exists but is not in `wiki/index.md` (or vice versa) |
+| Orphan page | A page file in `wiki/` with no row in `index.md` |
+| Missing page | An `index.md` row with no page file |
+| Stale page | `last_ingested` older than `wiki_stale_after_days` |
+| Missing source | `sources:` lists a file not in `knowledge/` (checked only when `knowledge/` has files) |
+| Missing cross-ref | A kebab-case `[[slug]]` in a page body with no matching page (inline mentions like `[[Apr 22]]` are ignored) |
 
-Lint exits with code 0 (no issues), 1 (warnings), 2 (errors).
-CI/CD can gate on lint exit code.
+Exit code: 0 = clean, 1 = issues found. CI/CD can gate on it.
 
 ### Lint output format
 
@@ -460,110 +399,46 @@ LINT RESULT: 2 warnings, 0 errors
 
 ---
 
-## 11. Migration from rag.py
+## 11. Migration from rag.py (complete)
 
-### What changes
+| Concern | v0.1 rag.py | v0.2 knowledge.py | v0.3 knowledge.py |
+|---------|-------------|-------------------|-------------------|
+| Ingestion trigger | File change → re-chunk and embed | File change → `build()` → wiki update | Same, with the serving model; deleted sources pruned |
+| Retrieval unit | 1024-char chunk | Whole wiki page (+ whole source files) | Wiki page finds the source; ranked source passages are read |
+| LLM reads | Raw document fragments | Wiki page + entire raw files, untrimmed | Best passages within `max_context_tokens` |
+| Index | ChromaDB only | `wiki/index.md` (BM25) + ChromaDB | Same |
+| Build model | Same as serving model | `wiki_builder_model` | Same; the watcher never uses it |
 
-| Concern | v0.1 rag.py | v0.2 knowledge.py |
-|---------|-------------|-------------------|
-| Ingestion trigger | File change → immediate re-chunk and embed | File change → `build()` → wiki update → re-embed whole page |
-| Retrieval unit | 1024-char chunk | Whole wiki page |
-| LLM reads | Raw document fragments | Synthesised wiki page |
-| Index | ChromaDB only | `wiki/index.md` (BM25) + ChromaDB (vector) |
-| Contradiction handling | None (duplicate chunks) | superseded annotation |
-| Staleness | None | `last_ingested` frontmatter + lint check |
-| Build model | Same as serving model | `wiki_builder_model` (can be larger) |
-
-### What stays the same
-
-- ChromaDB with SQLite backend at `vectorstore/`.
-- Embedding model: `nomic-embed-text` via Ollama.
-- Ollama generation API endpoint.
-- `similarity_threshold`, `rag_top_k` config keys (semantics unchanged; now apply to wiki pages).
-- The `query()` interface that `Router` calls.
-
-### Migration path (Phase 2)
-
-1. `WikiEngine` is implemented alongside `RAGEngine` initially.
-2. `Router` is updated to call `wiki_engine.query()` instead of `rag_engine.retrieve()`.
-3. Old ChromaDB collection (`del_fi_knowledge`) is left on disk but not written to.
-4. After a `--build-wiki` run, the new collection (`del_fi_wiki`) is populated.
-5. `rag.py` is removed in a follow-up commit once tests pass.
+The v0.1 `RAGEngine` (`rag.py`) was removed in v0.3; its ChromaDB collection
+(`del_fi_knowledge`) may still be on disk and can be deleted.
 
 ---
 
-## 13. Two-Tier Build System
+## 13. Background Watcher (and the planned patch())
 
-### 13.1 Motivation
+### 13.1 v0.3 behaviour
 
-`--build-wiki` (`build()`) uses the large `wiki_builder_model` to synthesise raw
-source documents into well-structured wiki pages. This is a deliberate, offline
-batch step — good output quality, but slow and resource-heavy. Running it on
-every file change in production would be impractical on edge hardware.
+`watch(interval, stop)` runs a thread (disabled by `wiki_watch_enabled:
+false`) that every `wiki_watch_interval_seconds`:
 
-The serving model (`model`) is small (1B–4B), already running, and capable of
-a **constrained** update task: given an existing wiki page as scaffold, append
-or modify only the changed facts. This is much simpler than synthesising from
-scratch, and within the ability of a 1B parameter model.
+1. prunes pages whose source was deleted (§6.6), and
+2. rebuilds the page of every changed or new source with
+   **`wiki_patch_model`, else the serving model** — never
+   `wiki_builder_model`, which may be far too large for the node (the
+   example config suggests a 12B builder for a Pi-class server).
 
-```
-wiki_builder_model (7B+)  →  build()   →  Foundation wiki — full synthesis
-                                           Run before deployment, or manually.
+A rebuild is a full single-page compile with the build prompt.
 
-model (1B–4B, serving)    →  patch()   →  Incremental update — append/update only
-                                           Run by watch() on file change.
-```
+### 13.2 Planned: constrained patch()
 
-### 13.2 Patch prompt
+Not implemented. The idea: give the serving model the existing page plus
+the changed content and ask it to add/update only the changed facts,
+preserving the structure the builder model produced, with a fallback to
+`build(file)`. Until then, pages rebuilt by the watcher are written by the
+serving model, so re-run `--build-wiki` with the big model after large
+changes.
 
-```
-SYSTEM:
-You are updating an existing wiki page for {node_name}.
-Do NOT restructure the page. Do NOT remove existing content.
-Add the new facts into the appropriate section(s).
-If new content contradicts existing claims, keep the old text,
-mark it superseded, and add the new claim (see contradiction format below).
-Output ONLY the full updated wiki page. No commentary.
-
-Contradiction format:
-> [superseded {today} by {source_filename}]
-<new claim>
-
-EXISTING WIKI PAGE:
-{existing_wiki_page}
-
-NEW/CHANGED CONTENT FROM SOURCE ({source_filename}):
-{diff_or_new_content}
-```
-
-### 13.3 What constitutes a "patch" vs a "full rebuild"
-
-| Scenario | Action | Model used |
-|----------|--------|-----------|
-| New entries appended to a log file (e.g. `community-log.md`) | `patch()` | serving model |
-| A sensor reading updated in-place | `patch()` | serving model |
-| Source file restructured significantly | `build(file_path)` | builder model |
-| New source file added to `knowledge/` | `build(file_path)` | builder model |
-| Source file deleted | `build()` (full, to remove stale refs) | builder model |
-| Manual `--build-wiki` CLI invocation | `build()` | builder model |
-
-`watch()` detects structural changes (> X% of lines changed, or file size change
-> `wiki_patch_threshold_pct` config key, default 40%) and routes to `build()`
-instead of `patch()` for those cases.
-
-### 13.4 Patch fallback
-
-If `patch()` fails (model error, parse error, empty output, malformed frontmatter),
-`WikiEngine` logs a warning and falls back to `build(file_path)` using the
-builder model. If the builder model is also unavailable, the existing wiki page
-is preserved unchanged and the failure is logged to `wiki/log.md`.
-
-### 13.5 ChromaDB on patch
-
-After a successful `patch()`, the wiki page embedding in ChromaDB is updated:
-the old document is replaced with the patched page content. Same as after `build()`.
-
-### 13.6 Peer knowledge — trust boundary
+### 13.3 Peer knowledge — trust boundary
 
 Peer-sourced answers (from `PeerCache`, Tier 2) do **not** flow into the wiki
 automatically. Reasons:
@@ -580,10 +455,12 @@ There is no automated wiki injection from peer sources.
 
 ## 12. `wiki/` Directory Conventions
 
-- All wiki page filenames: `kebab-case.md` (matches source filename).
+- Page filenames: the source filename's kebab-cased stem + `.md`.
 - Reserved filenames: `index.md`, `log.md` (generated automatically — do not create manually).
-- Hash files: `.<source-filename>.hash` (hidden, used for change detection).
-- Temp files: `<page>.md.tmp` (transient, cleaned up on build completion).
+- `.hash_cache.json`: `{source filename: md5}` for change detection.
+- Temp files: `<name>.<pid>.<thread>.tmp` exist only mid-write.
+- Only one process should build at a time: don't run `--build-wiki` while
+  the daemon's watcher is rebuilding.
 
 ---
 

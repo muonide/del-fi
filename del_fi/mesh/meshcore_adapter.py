@@ -37,7 +37,6 @@ class MeshCoreAdapter(MeshAdapter):
         self._should_run = True
         self._device = None
         self._lock = threading.Lock()
-        self._rate_limits: dict[str, float] = {}
         self.my_node_id: str | None = None
 
     def connect(self) -> bool:

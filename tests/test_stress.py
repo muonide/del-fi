@@ -18,7 +18,7 @@ import threading
 import time
 import unittest
 
-from del_fi.core.router import Router, MoreBuffer
+from del_fi.core.router import Router
 from del_fi.core.formatter import byte_len
 
 
@@ -62,8 +62,6 @@ def _make_cfg(tmpdir: str, **overrides) -> dict:
 
 def _mock_wiki(available=True, generate_delay=0.0, generate_text="Test answer."):
     """Return a mock WikiEngine with controllable latency."""
-    from del_fi.core.peers import PeerCache, GossipDirectory
-
     _avail = available          # avoid name clash with property
     _delay = generate_delay
     _text  = generate_text
@@ -89,6 +87,7 @@ def _mock_wiki(available=True, generate_delay=0.0, generate_text="Test answer.")
         def store(self, *a, **kw): pass
 
     class _MockGossipDir:
+        enabled = True
         peer_count = 0
         def list_peers(self): return []
         def receive(self, nid, txt): pass
@@ -295,7 +294,7 @@ class TestRateLimiterConcurrency(unittest.TestCase):
             self.assertIsNotNone(resp, f"user{i} was rate-limited on first msg")
 
     def test_same_sender_rate_limited(self):
-        """Router itself has no rate limiting — that's the mesh adapter's job."""
+        """Router itself has no rate limiting — that's the Dispatcher's job."""
         cfg = _make_cfg(self.tmpdir, rate_limit_seconds=60)
         wiki, peers, gossip = _mock_wiki()
         router = Router(cfg, wiki, peers, gossip)
@@ -494,7 +493,7 @@ class TestStatsUnderLoad(unittest.TestCase):
 
         self.assertEqual(len(router._response_cache), 3)
         for q in unique_questions:
-            self.assertIn(q.lower().strip(), router._response_cache)
+            self.assertIn(Router._cache_key(q), router._response_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -542,137 +541,12 @@ class TestLatencyProfile(unittest.TestCase):
 # Test: busy-notice dispatcher integration
 # ---------------------------------------------------------------------------
 
-class TestBusyNotice(unittest.TestCase):
-    """Verify the dispatcher + worker correctly sends busy ack messages."""
+class TestCommandsBypassWorker(unittest.TestCase):
+    """Commands are answered inline by the router. (Busy notices, rate
+    limiting and the worker itself are covered in test_dispatcher.py.)"""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="delfi-stress-")
-
-    def test_busy_notice_sent_when_worker_occupied(self):
-        """When the worker is busy, new query senders get an ack."""
-        cfg = _make_cfg(self.tmpdir, rate_limit_seconds=0)
-        cfg["busy_notice"] = True
-        llm_delay = 0.5
-        wiki, peers, gossip = _mock_wiki(generate_delay=llm_delay)
-        router = Router(cfg, wiki, peers, gossip)
-
-        msg_queue = queue.Queue()
-        query_queue = queue.Queue()
-        worker_busy = threading.Event()
-        pending_senders: set = set()
-        pending_lock = threading.Lock()
-        sent_messages: list = []
-        lock = threading.Lock()
-
-        def fake_send(sender_id, text):
-            with lock:
-                sent_messages.append((sender_id, text))
-
-        stop = threading.Event()
-
-        def worker():
-            while not stop.is_set():
-                try:
-                    sid, txt = query_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                worker_busy.set()
-                try:
-                    resp = router.route(sid, txt)
-                    if resp:
-                        fake_send(sid, resp)
-                finally:
-                    with pending_lock:
-                        pending_senders.discard(sid)
-                    worker_busy.clear()
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-
-        query_queue.put(("!userA", "What is solar power?"))
-        time.sleep(0.05)
-
-        self.assertTrue(worker_busy.is_set(), "Worker should be busy")
-        sid2 = "!userB"
-        with pending_lock:
-            already_pending = sid2 in pending_senders
-            pending_senders.add(sid2)
-
-        if worker_busy.is_set() and not already_pending:
-            position = query_queue.qsize() + 1
-            ack = router.busy_message(position)
-            fake_send(sid2, ack)
-
-        query_queue.put((sid2, "Where is the first aid tent?"))
-
-        time.sleep(llm_delay * 3)
-        stop.set()
-        t.join(timeout=2.0)
-
-        with lock:
-            senders_who_got_ack = [
-                sid for sid, text in sent_messages
-                if sid == "!userB" and ("hang tight" in text.lower() or "next" in text.lower())
-            ]
-            responses_to_b = [
-                text for sid, text in sent_messages
-                if sid == "!userB" and "Test answer" in text
-            ]
-
-        self.assertGreaterEqual(
-            len(senders_who_got_ack),
-            1,
-            f"userB should have received a busy ack, got: "
-            f"{[t for s, t in sent_messages if s == '!userB']}",
-        )
-        self.assertGreaterEqual(len(responses_to_b), 1, "userB should also get the real answer")
-
-    def test_no_busy_notice_when_worker_idle(self):
-        """When the worker is idle, queries are dispatched without ack."""
-        cfg = _make_cfg(self.tmpdir, rate_limit_seconds=0)
-        cfg["busy_notice"] = True
-        wiki, peers, gossip = _mock_wiki(generate_delay=0)
-        router = Router(cfg, wiki, peers, gossip)
-
-        worker_busy = threading.Event()
-        self.assertFalse(worker_busy.is_set())
-        self.assertEqual(router.classify("What is solar power?"), "query")
-
-    def test_no_duplicate_ack_for_same_sender(self):
-        """A sender with a pending query should not get spammed with acks."""
-        cfg = _make_cfg(self.tmpdir, rate_limit_seconds=0)
-        cfg["busy_notice"] = True
-        wiki, peers, gossip = _mock_wiki(generate_delay=0.3)
-        router = Router(cfg, wiki, peers, gossip)
-
-        pending_senders: set = set()
-        pending_lock = threading.Lock()
-        ack_count = 0
-
-        worker_busy = threading.Event()
-        worker_busy.set()
-
-        sid = "!userC"
-        for _ in range(5):
-            with pending_lock:
-                already_pending = sid in pending_senders
-                pending_senders.add(sid)
-            if worker_busy.is_set() and not already_pending:
-                ack_count += 1
-
-        self.assertEqual(ack_count, 1, f"Expected 1 ack, got {ack_count}")
-
-    def test_busy_notice_disabled_by_config(self):
-        """When busy_notice is False, no acks are sent."""
-        cfg = _make_cfg(self.tmpdir, rate_limit_seconds=0)
-        cfg["busy_notice"] = False
-        wiki, peers, gossip = _mock_wiki(generate_delay=0)
-        router = Router(cfg, wiki, peers, gossip)
-
-        worker_busy = threading.Event()
-        worker_busy.set()
-
-        self.assertFalse(cfg.get("busy_notice", True))
 
     def test_commands_bypass_worker(self):
         """Commands are classified as fast and never enter the query queue."""
