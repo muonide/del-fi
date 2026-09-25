@@ -123,10 +123,6 @@ class Router:
         self._cache_file = os.path.join(cfg["_cache_dir"], "response_cache.json")
         self._cache_dirty = False
 
-        # When set (by the daemon), !retry re-queues to the query worker
-        # instead of running the LLM on the caller's thread.
-        self.query_queue = None
-
         self._commands = {
             "!help": self._cmd_help,
             "!topics": self._cmd_topics,
@@ -339,13 +335,11 @@ class Router:
     def _cmd_retry(
         self, sender_id: str, arg: str
     ) -> tuple[str | None, MoreBuffer | None]:
+        # The daemon's Dispatcher intercepts !retry and runs it on the query
+        # worker; this inline path serves the GUI simulator and tests.
         last = self.prepare_retry(sender_id)
         if last is None:
             return "No previous query to retry. Ask a question first.", None
-        if self.query_queue is not None:
-            self.query_queue.put((sender_id, last))
-            return "Retrying...", None
-        # Outside the daemon (GUI, tests): answer inline.
         response, provenance = self._handle_query(sender_id, last)
         return self._finalize(sender_id, response, provenance)
 

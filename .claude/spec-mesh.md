@@ -144,23 +144,11 @@ def _on_receive(self, packet, interface):
 
 ### 2.3 Rate limiting
 
-Freeform queries (not commands) are rate-limited per sender.
-Commands (`!`-prefix) bypass the rate limiter always.
-
-```python
-# per-sender timestamp tracking
-def _is_rate_limited(self, sender: str) -> bool:
-    now = time.monotonic()
-    last = self._rate_timestamps.get(sender, 0.0)
-    if now - last < self._rate_limit_seconds:
-        return True
-    self._rate_timestamps[sender] = now
-    return False
-```
-
-Config key: `rate_limit_seconds` (default: 30). 0 disables rate limiting.
-
-Rate limit response: `"[rate limited — wait {remaining:.0f}s]"`
+Adapters do **not** rate-limit. Rate limiting is protocol-agnostic and lives
+in the `Dispatcher` (`del_fi/core/dispatcher.py`), so every adapter gets the
+same behaviour: one question per `rate_limit_seconds` per sender, commands
+exempt (except `!retry`), and one "slow down" reply per window instead of a
+silent drop. See `.claude/spec-router.md §5`.
 
 ### 2.4 Message deduplication
 

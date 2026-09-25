@@ -26,7 +26,6 @@ class MeshtasticAdapter(MeshAdapter):
         self.interface = None
         self.my_node_id: str | None = None
         self._seen_ids: collections.deque = collections.deque(maxlen=500)
-        self._rate_limits: dict[str, float] = {}
         self._lock = threading.Lock()
         self._connected = False
         self._should_run = True
@@ -88,17 +87,8 @@ class MeshtasticAdapter(MeshAdapter):
                 log.info(f"← broadcast from {sender}: {text[:60]}")
                 return
 
-            is_command = text.strip().startswith("!")
-            if not is_command:
-                with self._lock:
-                    now = time.time()
-                    last = self._rate_limits.get(sender, 0)
-                    if now - last < self.cfg["rate_limit_seconds"]:
-                        log.debug(f"rate limited: {sender}")
-                        return
-                    self._rate_limits[sender] = now
-
-            log.info(f'← query from {sender}: "{text[:80]}"')
+            # Rate limiting and queueing happen in the Dispatcher.
+            log.info(f'← {sender}: "{text[:80]}"')
             self.msg_queue.put((sender, text.strip()))
 
         except Exception:

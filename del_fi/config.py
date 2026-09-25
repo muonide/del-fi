@@ -41,6 +41,8 @@ DEFAULTS: dict = {
     "radio_connection": "serial",
     "radio_port": "/dev/ttyUSB0",
     "rate_limit_seconds": 30,
+    "rate_limit_notice": True,           # one "slow down" reply per window
+    "query_queue_size": 10,              # questions waiting for the LLM
     "channels": [],
     # --- Ollama ---
     "ollama_host": "http://localhost:11434",
@@ -275,6 +277,10 @@ def _validate(cfg: dict) -> None:
     rate = cfg.get("rate_limit_seconds", 30)
     if not isinstance(rate, (int, float)) or rate < 0:
         _die(f"rate_limit_seconds must be a non-negative number (got {rate!r})")
+
+    qsize = cfg.get("query_queue_size", 10)
+    if not isinstance(qsize, int) or isinstance(qsize, bool) or qsize < 1:
+        _die(f"query_queue_size must be a positive integer (got {qsize!r})")
 
     ttl = cfg.get("response_cache_ttl", 300)
     if not isinstance(ttl, (int, float)) or ttl < 0:

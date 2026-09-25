@@ -80,8 +80,9 @@ If config.yaml is missing, the daemon exits with an error (not a default).
 
 | Key | Type | Default | Required | Description |
 |-----|------|---------|----------|-------------|
-| `rate_limit_seconds` | int | `30` | No | Per-sender query rate limit in seconds. 0 = disabled. Commands always bypass. |
-| `query_queue_size` | int | `20` | No | Max items in the query worker queue before dropping oldest. |
+| `rate_limit_seconds` | int | `30` | No | Per-sender question rate limit in seconds (`!retry` counts as a question). 0 = disabled. Other commands always bypass. |
+| `rate_limit_notice` | bool | `true` | No | Reply once per window when a sender is rate-limited ("One question per 30s…"). `false` = drop silently. |
+| `query_queue_size` | int | `10` | No | Max questions waiting for the LLM. When full, new questions are turned away with a "too many questions queued" reply (never silently dropped). |
 
 ### 2.6 Conversation Memory
 

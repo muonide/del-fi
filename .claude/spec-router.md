@@ -219,54 +219,53 @@ Config key: `response_cache_ttl` (default: 300 seconds).
 
 ---
 
-## 5. Query Worker
+## 5. Dispatcher and Query Worker
 
-### 5.1 Architecture
+`del_fi/core/dispatcher.py` — the daemon's main loop, unit-tested directly
+(`tests/test_dispatcher.py`). `main.py` only wires it up.
 
-A single background `threading.Thread` reads from `msg_queue: queue.Queue`.
-Using a single worker provides:
-- Natural FIFO ordering per sender
-- No concurrent LLM calls (which would exceed memory budget on small hardware)
-- Simple backpressure: queue.Full drops the oldest item with a log warning
+### 5.1 Inbound handling (dispatcher thread)
 
-```python
-msg_queue = queue.Queue(maxsize=20)  # configurable: query_queue_size
-```
+| Message | Handling |
+|---------|----------|
+| empty | ignored |
+| gossip (`DEL-FI:`) | `router.route()` inline; no reply |
+| command (except `!retry`) | `router.route_multi()` inline; replies sent immediately |
+| question, or `!retry` | rate limit → queue → worker |
 
-If queue is full when a new query arrives: discard the oldest item and enqueue
-the new one. Log: `"queue full — dropped oldest query from %s"`
+`!retry` asks `router.prepare_retry(sender)` for the sender's last question
+(evicting its cached answer) and then goes through the same path as a new
+question, so it runs on the worker and counts against the rate limit.
 
-### 5.2 Worker loop
+### 5.2 Rate limit and queue
 
-```python
-def _query_worker(self) -> None:
-    while not self._shutdown.is_set():
-        try:
-            item = self._msg_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        
-        sender, query = item
-        try:
-            response = self._run_tier_hierarchy(sender, query)
-            response = self._formatter.format(response)
-            chunks = self._formatter.chunk(response)
-            self._store_more_buffer(sender, query, chunks)
-            for i, chunk in enumerate(chunks[:self._auto_send_chunks]):
-                self._adapter.send_dm(sender, chunk)
-                if i < len(chunks) - 1:
-                    time.sleep(self._chunk_delay_seconds)
-        except Exception:
-            log.exception("Query worker error for sender %s", sender)
-            self._adapter.send_dm(sender, self._config.get("error_message", "Error."))
-        finally:
-            self._msg_queue.task_done()
-```
+1. **Rate limit** (`rate_limit_seconds`, default 30, 0 = off): one accepted
+   question per sender per window, measured with a monotonic clock (immune
+   to the wall-clock jumps a Pi without an RTC makes when NTP syncs). A
+   rate-limited question gets **one** reply per window —
+   `"NODE: One question per 30s, please. Try again in 12s. Commands still work."`
+   — and further ones are dropped silently (`rate_limit_notice: false`
+   silences the reply too).
+2. **Queue depth** (`query_queue_size`, default 10): when full, the new
+   question is turned away with `"NODE: Too many questions queued right now.
+   Try again in a few minutes."`. Queued questions are never dropped.
+3. **Busy notice** (`busy_notice`, default on): if the worker is busy, a
+   sender with nothing else pending gets `router.busy_message(position)` —
+   "yours is next" or "N questions ahead of yours".
 
-### 5.3 Shutdown
+### 5.3 Worker
 
-`self._shutdown` is a `threading.Event`. Set on SIGINT/SIGTERM. The worker exits
-cleanly after completing the current in-flight item.
+One worker thread, one LLM call at a time (small hardware cannot afford
+more). For each question it sends `router.route_multi()`'s messages with a
+0.5 s pause between chunks. Any exception is logged with its traceback and
+the sender gets `"I hit an error processing that. Try again."`.
+
+### 5.4 Shutdown
+
+SIGINT/SIGTERM set the stop flag; `Dispatcher.run()` returns within half a
+second, then `main.py` flushes the response cache and closes the radio. An
+in-flight LLM call is abandoned (waiting up to `ollama_timeout` would exceed
+systemd's default stop timeout).
 
 ---
 

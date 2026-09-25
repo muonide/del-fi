@@ -656,18 +656,7 @@ def test_llm_error_is_not_cached():
     assert "Real answer." in router.route("!b", "where are the elk")
 
 
-# --- v0.3: !retry reaches the worker queue ---
-
-
-def test_retry_uses_query_queue_when_set():
-    import queue as queue_mod
-    wiki = _ScriptedWiki("First.", "Second.")
-    router = _router_with(wiki)
-    router.query_queue = queue_mod.Queue()
-    router.route("!a", "what is the trail like")
-    assert router.route("!a", "!retry") == "Retrying..."
-    assert router.query_queue.get_nowait() == ("!a", "what is the trail like")
-    assert len(wiki.calls) == 1  # not re-run inline
+# --- v0.3: !retry ---
 
 
 def test_retry_inline_bypasses_cache():
