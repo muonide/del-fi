@@ -234,7 +234,7 @@ pip install flask   # if not already installed
 python main.py --gui
 ```
 
-A local control panel for editing config, building the wiki, chatting with the oracle, and reading the board and logs. It listens on `127.0.0.1` only; on a headless Pi, use `ssh -L 5174:localhost:5174 pi@yourpi` and open `http://localhost:5174`. Saving config keeps settings the form doesn't show and backs up the previous file to `config.yaml.bak`.
+A local control panel for editing config, building the wiki, chatting with the oracle, and reading the board and logs. It listens on `127.0.0.1` only; on a headless Pi, use `ssh -L 5174:localhost:5174 pi@yourpi` and open `http://localhost:5174`. Saving config keeps settings the form doesn't show and backs up the previous file to `config.yaml.bak`; comments in the file are not kept.
 
 ### MeshCore Configuration
 

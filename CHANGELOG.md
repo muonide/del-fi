@@ -79,8 +79,9 @@ review of v0.2 is fixed with a regression test.
 ### GUI
 
 - Saving config no longer deletes settings the form doesn't show
-  (`mesh_knowledge`, `meshcore`, board filters) or your comments: it merges,
-  validates first, and keeps `config.yaml.bak`.
+  (`mesh_knowledge`, `meshcore`, board filters): it merges, validates first,
+  and backs up the previous file to `config.yaml.bak`. Comments in the file
+  are not kept.
 - Other websites can no longer change your config through the GUI (CSRF /
   DNS-rebinding guard).
 - The chat simulator uses a sandbox, so testing never affects what radio
