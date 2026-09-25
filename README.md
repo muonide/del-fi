@@ -490,7 +490,7 @@ Everything else is fair game.
 
 **Meshmouth** — LLM-native wire format for oracle-to-oracle traffic.
 
-Right now gossip and peer sync use human-readable strings. Both ends are language models — they don't need `key=value` headers and full English sentences on the wire. Meshmouth is a compact encoding that LLMs can produce and consume natively: fixed token-budget preambles, lossy semantic compression, symbolic shorthand, and negotiated per-pair codebooks. The goal is 3–5× more meaning in the same 230-byte LoRa frame when oracles talk to each other, while still decompressing cleanly for human questioners. Think of it as a pidgin the oracles converge on — not a hand-designed binary protocol, but a model-discovered compressed language.
+Today gossip uses human-readable strings, and peer sync would too. Both ends are language models — they don't need `key=value` headers and full English sentences on the wire. Meshmouth is a compact encoding that LLMs can produce and consume natively: fixed token-budget preambles, lossy semantic compression, symbolic shorthand, and negotiated per-pair codebooks. The goal is 3–5× more meaning in the same 230-byte LoRa frame when oracles talk to each other, while still decompressing cleanly for human questioners. Think of it as a pidgin the oracles converge on — not a hand-designed binary protocol, but a model-discovered compressed language.
 
 ---
 
