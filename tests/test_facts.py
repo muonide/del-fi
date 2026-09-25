@@ -527,6 +527,135 @@ def test_router_without_fact_store_still_works():
         assert "pong" in response.lower()
 
 
+# --- v0.3: timestamp contract ---
+
+
+def _store(**cfg):
+    tmpdir = tempfile.mkdtemp(prefix="delfi-facts-")
+    base = {"_cache_dir": os.path.join(tmpdir, "cache"), "node_name": "RIDGELINE",
+            "fact_query_keywords": ["temperature", "temp", "wind", "current", "cam1"]}
+    base.update(cfg)
+    return FactStore(base)
+
+
+def test_unix_float_timestamp_from_spec_works():
+    """v0.2 crashed with OverflowError on the spec's own feed format."""
+    fs = _store()
+    fs.ingest({"temperature": {"value": 41.2, "unit": "F", "source": "davis",
+                               "timestamp": time.time() - 30}})
+    assert fs.lookup("what's the temperature?") == "RIDGELINE: Temperature: 41.2 F (davis, now)"
+
+
+def test_numeric_string_timestamp():
+    fs = _store()
+    fs.ingest({"temperature": {"value": 1, "source": "s", "timestamp": str(time.time() - 600)}})
+    assert "10m ago" in fs.format_value("temperature")
+
+
+def test_iso_z_and_offset_timestamps():
+    from del_fi.core.facts import _parse_timestamp
+    z = _parse_timestamp("2026-04-22T10:00:00Z")
+    off = _parse_timestamp("2026-04-22T04:00:00-06:00")
+    assert z is not None and z == off
+
+
+def test_naive_iso_is_local_time():
+    if not hasattr(time, "tzset"):
+        return
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Denver"
+    time.tzset()
+    try:
+        from datetime import datetime
+        age = _age(datetime.now().isoformat())
+        assert age < 60, f"naive local timestamp read as {age:.0f}s old"
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def test_confidence_label_or_number():
+    fs = _store()
+    fs.ingest({"wind": {"value": 5, "source": "s", "timestamp": time.time(), "confidence": "measured"},
+               "temperature": {"value": 3, "source": "s", "timestamp": time.time(), "confidence": 0.9}})
+    assert "measured" in fs.format_value("wind")
+    assert "90% conf" in fs.format_value("temperature")
+
+
+def test_future_timestamp_counts_as_now():
+    assert _age(time.time() + 120) == 0.0
+
+
+def test_unparseable_timestamp_is_stale_not_a_crash():
+    fs = _store()
+    fs.ingest({"temperature": {"value": 3, "source": "s", "timestamp": "yesterday-ish"}})
+    line = fs.format_value("temperature")
+    assert "STALE" in line and "unknown time" in line
+    assert "STALE" in fs.format_snapshot()
+
+
+def test_bad_stale_after_rejects_only_that_fact():
+    fs = _store()
+    count, errors = fs.ingest({
+        "wind": {"value": 5, "source": "s", "timestamp": time.time(), "stale_after_seconds": "soon"},
+        "temperature": {"value": 3, "source": "s", "timestamp": time.time()},
+    })
+    assert count == 1 and len(errors) == 1 and "stale_after_seconds" in errors[0]
+
+
+def test_persisted_malformed_entries_skipped():
+    fs = _store()
+    fs.ingest({"temperature": {"value": 3, "source": "s", "timestamp": time.time()}})
+    with open(fs._store_file) as f:
+        data = json.load(f)
+    data["broken"] = {"value": 1}
+    with open(fs._store_file, "w") as f:
+        json.dump(data, f)
+    fs2 = FactStore(fs.cfg)
+    assert list(fs2.get_all()) == ["temperature"]
+
+
+# --- v0.3: whole-word keyword matching ---
+
+
+def test_keyword_gate_is_whole_word():
+    fs = _store()
+    fs.ingest({"temperature": {"value": 3, "source": "s", "timestamp": time.time()}})
+    assert fs.lookup("when is the temple open?") is None
+
+
+def test_abbreviation_matches_key():
+    fs = _store()
+    fs.ingest({"temperature_f": {"value": 3, "source": "s", "timestamp": time.time()}})
+    assert "Temperature F: 3" in fs.lookup("what's the temp")
+
+
+def test_generic_key_words_do_not_match():
+    fs = _store()
+    fs.ingest({"current_temp": {"value": 3, "source": "s", "timestamp": time.time()}})
+    assert fs.lookup("what is the current bulk trash schedule") is None
+    assert "Current Temp: 3" in fs.lookup("current temp please")
+
+
+def test_window_is_not_wind():
+    fs = _store()
+    fs.ingest({"wind_speed": {"value": 12, "source": "s", "timestamp": time.time()}})
+    assert fs.lookup("is the current window schedule posted?") is None
+    assert "Wind Speed: 12" in fs.lookup("wind speed?")
+
+
+def test_cmd_data_with_unparseable_timestamp_replies():
+    """v0.2: !data raised on bad timestamps, so the sender got no reply."""
+    with tempfile.TemporaryDirectory(prefix="delfi-test-") as tmpdir:
+        router, _, _ = _make_router_with_facts(tmpdir, {
+            "temperature": {"value": 3, "source": "s", "timestamp": "garbage"},
+        })
+        assert "STALE" in router.route("sender1", "!data")
+
+
 # ---------------------------------------------------------------------------
 # unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------

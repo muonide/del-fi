@@ -1,0 +1,31 @@
+{
+  "temperature": {
+    "value": 28.4,
+    "unit": "°F",
+    "timestamp": 1777000000,
+    "source": "davis-vp2",
+    "stale_after_seconds": 900,
+    "confidence": "measured"
+  },
+  "wind_speed": {
+    "value": 14,
+    "unit": "mph",
+    "timestamp": "2026-04-24T03:06:40Z",
+    "source": "davis-vp2",
+    "stale_after_seconds": 900
+  },
+  "snow_depth": {
+    "value": 34,
+    "unit": "in",
+    "timestamp": "2026-04-23T18:00:00-06:00",
+    "source": "staff-gauge",
+    "stale_after_seconds": 86400,
+    "confidence": 0.8
+  },
+  "cam1_last_detection": {
+    "value": "elk herd (8 cows, 2 calves)",
+    "timestamp": 1777000000,
+    "source": "CAM-1",
+    "stale_after_seconds": 86400
+  }
+}

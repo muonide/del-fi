@@ -221,162 +221,83 @@ entries are skipped on load.
 
 File: `del_fi/core/facts.py` | Class: `FactStore`
 
-Provides a **Tier 0 fast path** for sensor data queries. If the query matches
-sensor keywords, return the live reading directly — no LLM call needed.
+Provides a **Tier 0 fast path** for sensor data queries. If the question
+matches, the live reading is returned directly — no LLM call, no cache.
 
 ### 3.1 sensor_feed.json schema
+
+External scripts write `cache/sensor_feed.json` (or `fact_feed_file`); it is
+re-read whenever its mtime changes. Full example:
+`examples/sensor_feed.example.json`.
 
 ```json
 {
   "temperature": {
-    "value": -3.2,
-    "unit": "°C",
-    "timestamp": 1714000000.0,
-    "source": "davis-vantage-pro2",
-    "stale_after_seconds": 300,
+    "value": 28.4,
+    "unit": "°F",
+    "timestamp": 1777000000,
+    "source": "davis-vp2",
+    "stale_after_seconds": 900,
     "confidence": "measured"
-  },
-  "wind_speed": {
-    "value": 14.7,
-    "unit": "km/h",
-    "timestamp": 1714000000.0,
-    "source": "davis-vantage-pro2",
-    "stale_after_seconds": 300,
-    "confidence": "measured"
-  },
-  "snow_depth": {
-    "value": 87,
-    "unit": "cm",
-    "timestamp": 1713913600.0,
-    "source": "manual-staff-gauge",
-    "stale_after_seconds": 86400,
-    "confidence": "estimated"
   }
 }
 ```
 
-### 3.2 Schema field definitions
-
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `value` | number | Yes | Current reading |
-| `unit` | string | Yes | Unit of measure |
-| `timestamp` | float | Yes | Unix timestamp of the reading |
-| `source` | string | Yes | Instrument or data origin identifier |
-| `stale_after_seconds` | int | Yes | Age at which the reading is considered stale |
-| `confidence` | string | No | `"measured"`, `"estimated"`, `"forecast"` |
+| `value` | any scalar | Yes | The reading, shown as-is |
+| `timestamp` | number or string | Yes | When it was measured (see §3.2) |
+| `source` | string | Yes | Instrument or origin, shown in the reply |
+| `unit` | string | No | Appended to the value |
+| `stale_after_seconds` | int | No (3600) | Age after which the reply says STALE |
+| `confidence` | 0.0–1.0 or string | No | Shown as "80% conf" or the label ("measured") |
+
+A fact that fails validation is skipped with a logged error; the rest of
+the feed is still ingested. Facts are persisted to `cache/facts.json`
+(atomic write) and survive restarts.
+
+### 3.2 Timestamps
+
+- **Unix seconds** (int, float, or numeric string) — unambiguous, preferred.
+- **ISO-8601 with `Z` or an offset** — `2026-04-24T03:06:40Z`,
+  `2026-04-23T18:00:00-06:00` (`Z` works on Python 3.10 too).
+- **Naive ISO-8601** — taken as the node's **local** time, which is what
+  `datetime.now().isoformat()` writes on the same host.
+- Unparseable → the fact is always STALE and shows "as of unknown time".
+- Slightly in the future (clock skew) → age 0.
 
 ### 3.3 Configuration keys
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `sensor_feed_path` | str | `cache/sensor_feed.json` | Path to sensor_feed.json |
-| `fact_query_keywords` | dict | `{}` | Maps query keyword → fact key(s) |
-| `fact_poll_interval` | int | 30 | How often (seconds) to re-read the file |
+| `fact_feed_file` | str | `cache/sensor_feed.json` | Path to the feed |
+| `fact_watch_interval_seconds` | int | 30 | Poll interval |
+| `fact_query_keywords` | list[str] | weather/camera words | Gate for Tier 0 (§3.4) |
 
-`fact_query_keywords` example:
+### 3.4 `lookup()` matching
 
-```yaml
-fact_query_keywords:
-  temperature: [temperature]
-  temp: [temperature]
-  weather: [temperature, wind_speed, wind_direction]
-  wind: [wind_speed, wind_direction]
-  snow: [snow_depth, snow_water_equivalent]
-  precipitation: [precip_1h, precip_24h]
-```
+Two whole-word gates:
 
-### 3.4 Public interface
+1. The question must contain one of `fact_query_keywords` as a whole word
+   or phrase (`temp` does not match "temple"; `right now` matches the phrase).
+2. A fact key must share a **specific** word with the question. Key words
+   are split on `_`/`-`; generic ones (`current`, `latest`, `last`, `now`,
+   `reading`, `value`, `level`, `status`, `sensor`, `data`, …) never decide
+   a match on their own. A question word of 4+ letters also matches a key
+   word it abbreviates (`temp` → `temperature`), and a trailing plural `s`
+   is ignored.
 
-```python
-class FactStore:
-    def watch(self) -> None:
-        """
-        Background thread. Polls sensor_feed.json every fact_poll_interval seconds.
-        On change: reload in-memory store. Continues until daemon shutdown.
-        """
-
-    def lookup(self, query: str) -> str | None:
-        """
-        Tier 0 fast path. Check if any fact_query_keywords match query.
-        If match: return formatted fact string. If no match: return None.
-        """
-
-    def snapshot(self) -> str:
-        """
-        Return all current readings as a human-readable string for !data command.
-        Includes freshness annotation for each reading.
-        """
-```
-
-### 3.5 Freshness computation
-
-```python
-def _freshness_label(self, key: str, entry: dict) -> str:
-    age_seconds = time.time() - entry["timestamp"]
-    stale_after = entry.get("stale_after_seconds", 300)
-    
-    if age_seconds > stale_after:
-        return f"[STALE — {_human_age(age_seconds)}]"
-    elif age_seconds < 60:
-        return "[now]"
-    else:
-        return f"[{_human_age(age_seconds)} ago]"
-
-def _human_age(seconds: float) -> str:
-    if seconds < 3600:
-        return f"{int(seconds/60)}m"
-    elif seconds < 86400:
-        return f"{seconds/3600:.1f}h"
-    else:
-        return f"{int(seconds/86400)}d"
-```
-
-### 3.6 `lookup()` return format
-
-```python
-# Temperature query
-"Temperature: -3.2°C [5m ago] (Davis VP2)"
-
-# Wind query (multiple facts)
-"Wind: 14.7 km/h NW [5m ago] | Gusts: 22.3 km/h [5m ago]"
-
-# Stale reading
-"Snow depth: 87cm [STALE — 2d ago] (manual gauge)"
-```
-
-### 3.7 `snapshot()` return format (for !data)
-
-Returns a multi-line string, each line one fact:
+All matching facts are returned on one line:
 
 ```
-=== Sensor Snapshot ===
-temperature: -3.2°C [5m] davis-vantage-pro2
-wind_speed: 14.7km/h [5m] davis-vantage-pro2
-snow_depth: 87cm [STALE 2d] manual-staff-gauge
+RIDGELINE: Temperature: 28.4 °F (davis-vp2, 5m ago, measured) | Wind Speed: 14 mph (davis-vp2, now)
+RIDGELINE: Snow Depth: 34 in (staff-gauge, as of Apr 24 00:00 — STALE, 80% conf)
 ```
 
-The snapshot is longer than 230 bytes; the Formatter will chunk it for `!data`.
+### 3.5 `format_snapshot()` (for !data)
 
-### 3.8 File watcher implementation
-
-Simple polling (no inotify / watchdog dependency):
-
-```python
-def watch(self) -> None:
-    last_mtime = 0.0
-    while not self._shutdown.is_set():
-        try:
-            mtime = os.path.getmtime(self._feed_path)
-            if mtime != last_mtime:
-                self._load()
-                last_mtime = mtime
-        except FileNotFoundError:
-            pass  # sensor feed not yet written; wait
-        except Exception:
-            log.exception("FactStore watch error")
-        self._shutdown.wait(self._poll_interval)
-```
+One line per fact, sorted by key, same format as above. Longer than one
+message → split on line boundaries with `!more`.
 
 ---
 
