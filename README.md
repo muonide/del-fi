@@ -137,38 +137,50 @@ File names become your topic list: `wilderness-first-aid.md` shows up as "Wilder
 
 ## Use It
 
-From any Meshtastic app, DM the Del-Fi node:
+From any Meshtastic app, DM the Del-Fi node. These exchanges are from [DAWN-CHORUS](examples/DAWN-CHORUS/DAWN-CHORUS.md), the example birding oracle, whose BirdNET listening station hears the preserve around the clock:
 
 ```
-You:   What animals have been spotted this week?
-Node:  CAM-1 logged elk herd (8 cows, 2 calves)
-       Feb 14. Coyote pair at 06:12 Feb 15.
-       Mountain lion — single adult, heading west.
-Node:  CAM-2 (Creek Crossing): mule deer Feb 12,
-       ermine Feb 16 at dawn. Fox near willows
-       Feb 17 18:44.
-Node:  CAM-3 (Spruce Hollow): gray wolf-like canid
-       Feb 17 23:11 — pending ID confirmation.
-       Total: 9 species, 21 events this week.
+You:   what's singing right now?
+Node:  DAWN-CHORUS: Singing Now: Pacific Wren 7:44, Song Sparrow
+       7:43, Chestnut-backed Chickadee 7:43, Spotted Towhee 7:42,
+       Red-breasted Nuthatch 7:41, Black-capped Chickadee 7:40
+       (birdnet-pi, 1m ago)
+You:   I heard a bird that goes fee-bee
+Node:  That's a Black-capped Chickadee: a clear two-note whistle,
+       the second note lower. Males sing it from January on.
+       Whistle it back and one may answer.
+       ---
+       DAWN-CHORUS: birds of Salmonberry Creek. !data = live detections
+You:   big woodpecker on a dead tree, what is it?
+Node:  Could be a Pileated Woodpecker or a Northern Flicker.
+       Pileated is crow-sized and black with a red crest; a
+       flicker is brown with a spotted belly. Which was it?
+You:   black with a red crest
+Node:  Black with a red crest: that's a Pileated Woodpecker, the
+       biggest woodpecker here. A pair has been chopping a big new
+       hole by Cedar Trail footbridge 2 this month.
 ```
 
-Responses up to 3 messages are delivered automatically. If the answer is longer than that, the last message ends with `[!more]`:
+The first answer comes straight from the station's live detections, with no language model involved. The rest come from the local LLM reading the knowledge base (its wording will vary), and it remembers the last few turns, so "black with a red crest" follows on. A sender's first answer that has room carries a short footer.
+
+Responses up to 3 messages are delivered automatically. If there is more, the last message ends with `[!more]`:
 
 ```
-You:   Tell me about mountain lions in detail
-Node:  Mountain lion (Puma concolor) — apex predator
-       at Ridgeline Station. Mostly nocturnal;
-       active dawn and dusk.
-Node:  Prey: elk calves, mule deer, snowshoe hare.
-       Territory 80-200 sq mi. Tracks: 3" round,
-       no claw marks (retractable).
-Node:  Feb 15 sighting: adult, ~120 lbs, heading
-       west along the ridge. Typical of winter
-       range expansion. [!more]
+You:   !data
+Node:  Birds Detected Today: 17 species, most often American Robin
+       (26), Pacific Wren (22), Chestnut-backed Chickadee (19),
+       Steller's Jay (15) (birdnet-pi, 1m ago)
+Node:  Dawn Chorus: 16 species 4-9 am, first American Robin at 6:18,
+       most often American Robin (26) (birdnet-pi, 1m ago)
+       New Arrivals: Varied Thrush (Sep 23), Golden-crowned Sparrow
+       (Sep 22) (birdnet-pi, 1m ago)
+Node:  Owls Tonight: since 18:00: Barred Owl (3), Western
+       Screech-Owl (1); last at 4:12 (birdnet-pi, 1m ago) [!more]
 You:   !more
-Node:  Avoid corner situations on trail. Make noise.
-       Do not run. If approached: stand tall, make
-       eye contact, back away slowly.
+Node:  Singing Now: Pacific Wren 7:44, Song Sparrow 7:43,
+       Chestnut-backed Chickadee 7:43, Spotted Towhee 7:42,
+       Red-breasted Nuthatch 7:41, Black-capped Chickadee 7:40
+       (birdnet-pi, 1m ago)
 ```
 
 ### Commands
@@ -225,7 +237,7 @@ Small models get tuned defaults automatically (a *profile* matched on the model 
 
 ### Sensor Data (Tier 0)
 
-Scripts can write live readings to `cache/sensor_feed.json` (next to your config). Questions like "what's the temperature?" are then answered straight from the feed — no LLM, no hallucination — with the reading's age, or `STALE` if it's old. See [`examples/sensor_feed.example.json`](examples/sensor_feed.example.json); timestamps can be Unix seconds or ISO-8601.
+Scripts can write live readings to `cache/sensor_feed.json` (next to your config). Questions like "what's the temperature?" are then answered straight from the feed — no LLM, no hallucination — with the reading's age, or `STALE` if it's old. See [`examples/sensor_feed.example.json`](examples/sensor_feed.example.json); timestamps can be Unix seconds or ISO-8601. [`examples/DAWN-CHORUS/birdnet_feed.py`](examples/DAWN-CHORUS/birdnet_feed.py) is a complete feed script for a BirdNET-Pi listening station.
 
 ### Web GUI
 
@@ -336,6 +348,8 @@ What peering will never do:
 ## Use Cases
 
 **Trail Oracle** — Solar node at a trailhead. Plant ID, trail conditions, wildlife, emergency procedures. No cell signal needed.
+
+**Birding Oracle** — Hikers identify birds by their songs from the trail, and a BirdNET listening station reports what's singing right now. See the [DAWN-CHORUS](examples/DAWN-CHORUS/DAWN-CHORUS.md) example.
 
 **Farm Oracle** — Planting calendars, livestock medicine, equipment repair. The knowledge in one person's head, available to everyone on the property.
 
