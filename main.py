@@ -64,6 +64,8 @@ def setup_logging(level: str, log_file: str = "", simulator: bool = False):
     for handler in handlers:
         handler.setFormatter(_DelFiFormatter())
         root.addHandler(handler)
+    # The ollama client's HTTP library logs every request at INFO.
+    logging.getLogger("httpx").setLevel(max(numeric, logging.WARNING))
 
 
 def default_log_file(cfg: dict, simulator: bool) -> str:

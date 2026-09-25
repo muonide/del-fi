@@ -204,6 +204,12 @@ class TestValidationV03(unittest.TestCase):
         self.assertEqual(cfg["_config_path"], os.path.join(os.path.realpath(self.tmpdir), "config.yaml"))
         self.assertEqual(cfg["log_file"], os.path.join(os.path.realpath(self.tmpdir), "logs", "delfi.log"))
 
+    def test_relative_paths_normalised(self):
+        cfg = self._read('node_name: "T"\nwiki_folder: ./wiki\nknowledge_folder: ./kb/../knowledge\n')
+        root = os.path.realpath(self.tmpdir)
+        self.assertEqual(cfg["wiki_folder"], os.path.join(root, "wiki"))
+        self.assertEqual(cfg["knowledge_folder"], os.path.join(root, "knowledge"))
+
     def test_node_name_coerced_to_string(self):
         self.assertEqual(self._read("node_name: 42\n")["node_name"], "42")
 

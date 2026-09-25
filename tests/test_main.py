@@ -34,5 +34,21 @@ class TestLogFormatter(unittest.TestCase):
         self.assertIn("KeyError: 'missing'", out)
 
 
+class TestSetupLogging(unittest.TestCase):
+    def test_httpx_request_logs_suppressed_at_info(self):
+        root = logging.getLogger()
+        before, level = list(root.handlers), root.level
+        httpx_level = logging.getLogger("httpx").level
+        try:
+            main.setup_logging("info")
+            self.assertEqual(logging.getLogger("httpx").level, logging.WARNING)
+        finally:
+            for h in list(root.handlers):
+                if h not in before:
+                    root.removeHandler(h)
+            root.setLevel(level)
+            logging.getLogger("httpx").setLevel(httpx_level)
+
+
 if __name__ == "__main__":
     unittest.main()

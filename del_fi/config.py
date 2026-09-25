@@ -252,18 +252,20 @@ def read_config(config_path: str | None = None) -> dict:
     wiki_raw = os.path.expanduser(wiki_raw)
     if not os.path.isabs(wiki_raw):
         wiki_raw = os.path.join(config_dir, wiki_raw)
-    cfg["wiki_folder"] = wiki_raw
+    cfg["wiki_folder"] = os.path.normpath(wiki_raw)
 
     # knowledge_folder
     knowledge_raw = os.path.expanduser(str(cfg.get("knowledge_folder") or "./knowledge"))
     if not os.path.isabs(knowledge_raw):
         knowledge_raw = os.path.join(config_dir, knowledge_raw)
-    cfg["knowledge_folder"] = knowledge_raw
+    cfg["knowledge_folder"] = os.path.normpath(knowledge_raw)
 
     # log_file (optional)
     if cfg.get("log_file"):
         log_raw = os.path.expanduser(str(cfg["log_file"]))
-        cfg["log_file"] = log_raw if os.path.isabs(log_raw) else os.path.join(config_dir, log_raw)
+        cfg["log_file"] = os.path.normpath(
+            log_raw if os.path.isabs(log_raw) else os.path.join(config_dir, log_raw)
+        )
 
     # Derived runtime paths (all relative to config dir)
     cfg["_config_path"] = str(path.resolve())
