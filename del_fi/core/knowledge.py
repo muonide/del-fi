@@ -85,6 +85,29 @@ _IDK_PATTERNS = (
     "no information available",
 )
 
+class LLMError(Exception):
+    """Answer generation failed.
+
+    kind is "unavailable" (Ollama unreachable), "timeout" (model too slow)
+    or "error" (anything else, e.g. model not pulled). The router turns
+    these into an honest reply instead of claiming it has no docs.
+    """
+
+    def __init__(self, kind: str, detail: str = ""):
+        super().__init__(f"{kind}: {detail}" if detail else kind)
+        self.kind = kind
+
+
+def _classify_llm_error(exc: Exception) -> str:
+    # ollama raises builtin ConnectionError when it cannot connect and
+    # httpx.*Timeout on slow responses; match by name to avoid importing httpx.
+    if isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__:
+        return "timeout"
+    if isinstance(exc, ConnectionError) or "Connect" in type(exc).__name__:
+        return "unavailable"
+    return "error"
+
+
 # Build prompt: given raw source content, produce a structured wiki page
 WIKI_BUILD_PROMPT = """\
 You are a knowledge compiler. Your job is to turn a raw source document into
@@ -461,7 +484,7 @@ class WikiEngine:
 
         Returns (answer, had_context). If had_context is False the caller
         should not cache the result and should consider falling through to
-        Tier 2.
+        Tier 2. Raises LLMError if the model could not be reached or failed.
         """
         if not self._ollama_available:
             return "", False
@@ -540,8 +563,9 @@ class WikiEngine:
         # Step 5: Assemble and generate
         answer = self._generate(q, context, peer_ctx=peer_ctx, history=history,
                                 board_context=board_context)
-        # _generate returns "" on IDK or exception — treat as no match so the
-        # router falls through to suggest() rather than caching a dead response.
+        # _generate returns "" when the model declines (IDK) — treat as no
+        # match so the router falls through to the next tier rather than
+        # caching a dead response. Generation failures raise LLMError.
         if not answer:
             return "", False
         return answer, True
@@ -588,8 +612,12 @@ class WikiEngine:
             )
             text = response.response.strip()
         except Exception as e:
-            log.error(f"LLM generation failed: {e}")
-            return ""
+            kind = _classify_llm_error(e)
+            if kind == "unavailable":
+                # Let the health-check loop take over until Ollama is back.
+                self._ollama_available = False
+            log.error(f"LLM generation failed ({kind}): {e}")
+            raise LLMError(kind, str(e)) from e
 
         # If the LLM refused to answer from context, return "" so the caller
         # falls through to suggest() rather than caching a useless response.

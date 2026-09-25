@@ -6,6 +6,8 @@ import os
 import threading
 import time
 
+from del_fi.core.fsutil import write_atomic
+
 log = logging.getLogger("del_fi.core.memory")
 
 MAX_TURNS_HARD_CAP = 50
@@ -124,15 +126,10 @@ class ConversationMemory:
             log.warning(f"could not load conversation memory: {e}")
 
     def _save_disk(self):
-        try:
+        with self._lock:
             data = {
                 sender: {"turns": list(e["turns"]), "ts": e["ts"]}
                 for sender, e in self._store.items()
+                if not self._expired(e)
             }
-            tmp = self._memory_file + ".tmp"
-            os.makedirs(os.path.dirname(tmp), exist_ok=True)
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, self._memory_file)
-        except Exception as e:
-            log.warning(f"could not save conversation memory: {e}")
+        write_atomic(self._memory_file, json.dumps(data))

@@ -494,7 +494,7 @@ class TestStatsUnderLoad(unittest.TestCase):
 
         self.assertEqual(len(router._response_cache), 3)
         for q in unique_questions:
-            self.assertIn(q.lower().strip(), router._response_cache)
+            self.assertIn(Router._cache_key(q), router._response_cache)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import secrets
 import threading
 import time
 
+from del_fi.core.fsutil import write_atomic
 from del_fi.core.text import one_line, tokenize
 
 log = logging.getLogger("del_fi.core.board")
@@ -259,13 +260,6 @@ class Board:
             log.warning(f"could not load board: {e}")
 
     def _save_disk(self):
-        try:
-            with self._lock:
-                data = {"posts": list(self._posts)}
-            os.makedirs(os.path.dirname(self._board_file) or ".", exist_ok=True)
-            tmp = self._board_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, self._board_file)
-        except Exception as e:
-            log.warning(f"could not save board: {e}")
+        with self._lock:
+            data = {"posts": list(self._posts)}
+        write_atomic(self._board_file, json.dumps(data))

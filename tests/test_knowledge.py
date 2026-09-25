@@ -327,6 +327,39 @@ class TestQueryPipeline(unittest.TestCase):
         self.assertIsInstance(answer, str)
         self.assertFalse(had_context, "had_context should be False when Ollama is down")
 
+    def test_query_connection_failure_raises_and_marks_ollama_down(self):
+        from del_fi.core.knowledge import LLMError
+        self._write_wiki("area-overview", "Area Overview", ["area", "elevation"],
+                         "Station sits at 2400m above sea level.")
+
+        class Refusing(_FakeOllamaClient):
+            def generate(self, **kwargs):
+                raise ConnectionError("Failed to connect to Ollama")
+
+        engine = _make_engine(self.tmpdir, ollama_client=Refusing())
+        with self.assertRaises(LLMError) as ctx:
+            engine.query("What elevation is the station?")
+        self.assertEqual(ctx.exception.kind, "unavailable")
+        self.assertFalse(engine.available, "health loop should take over")
+
+    def test_query_timeout_raises_but_keeps_ollama_up(self):
+        from del_fi.core.knowledge import LLMError
+        self._write_wiki("area-overview", "Area Overview", ["area", "elevation"],
+                         "Station sits at 2400m above sea level.")
+
+        class ReadTimeout(Exception):  # same name as httpx's timeout
+            pass
+
+        class Slow(_FakeOllamaClient):
+            def generate(self, **kwargs):
+                raise ReadTimeout("timed out")
+
+        engine = _make_engine(self.tmpdir, ollama_client=Slow())
+        with self.assertRaises(LLMError) as ctx:
+            engine.query("What elevation is the station?")
+        self.assertEqual(ctx.exception.kind, "timeout")
+        self.assertTrue(engine.available)
+
     def test_query_passes_peer_context(self):
         """query() includes peer context in the LLM prompt when provided."""
         self._write_wiki(

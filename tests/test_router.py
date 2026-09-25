@@ -470,6 +470,228 @@ def test_dispatcher_fast_vs_slow_classification():
         assert router.classify(q) == "query", f"{q!r} should be 'query'"
 
 
+# --- v0.3 regressions: !more buffer lifecycle ---
+
+
+_LONG = " ".join(f"Sentence number {i} has some useful trail facts in it." for i in range(40))
+
+
+class _ScriptedWiki(MockWiki):
+    """Returns queued answers in order, then a default."""
+
+    def __init__(self, *answers):
+        super().__init__()
+        self.answers = list(answers)
+        self.calls = []
+
+    def query(self, text, peer_ctx="", history="", board_context=""):
+        self.calls.append({"text": text, "history": history, "board": board_context})
+        answer = self.answers.pop(0) if self.answers else "Default answer."
+        if isinstance(answer, Exception):
+            raise answer
+        return answer, True
+
+
+def _router_with(wiki, **overrides):
+    tmpdir = tempfile.mkdtemp(prefix="delfi-test-")
+    router = Router(_make_cfg(tmpdir, **overrides), wiki, MockPeerCache(), MockGossipDir())
+    return router
+
+
+def test_command_after_long_answer_sends_only_its_own_reply():
+    router = _router_with(_ScriptedWiki(_LONG))
+    router.route_multi("!a", "tell me everything")
+    assert router.route_multi("!a", "!ping") == ["pong from TEST-NODE"]
+
+
+def test_short_answer_after_long_answer_is_not_padded_with_old_chunks():
+    router = _router_with(_ScriptedWiki(_LONG, "Short answer."))
+    router.route_multi("!a", "tell me everything")
+    msgs = router.route_multi("!a", "is the gate open")
+    assert len(msgs) == 1 and msgs[0].startswith("Short answer.")
+    assert "Sentence number" not in msgs[0]
+
+
+def test_new_answer_clears_unfinished_buffer():
+    router = _router_with(_ScriptedWiki(_LONG, "Short answer."))
+    router.route_multi("!a", "tell me everything")
+    router.route_multi("!a", "is the gate open")
+    assert "No pending" in router.route("!a", "!more")
+
+
+def test_more_returns_exactly_one_chunk():
+    router = _router_with(_ScriptedWiki(_LONG))
+    router.route_multi("!a", "tell me everything")
+    assert len(router.route_multi("!a", "!more")) == 1
+    assert len(router.route_multi("!a", "!more 2")) == 1
+
+
+def test_short_command_keeps_pending_answer_resumable():
+    router = _router_with(_ScriptedWiki(_LONG))
+    sent = router.route_multi("!a", "tell me everything")
+    router.route_multi("!a", "!status")
+    nxt = router.route("!a", "!more")
+    assert "Sentence number" in nxt
+    assert nxt not in sent
+
+
+def test_more_buffers_isolated_per_sender():
+    router = _router_with(_ScriptedWiki(_LONG))
+    router.route_multi("!a", "tell me everything")
+    assert "No pending" in router.route("!b", "!more")
+
+
+# --- v0.3: long command output is paginated ---
+
+
+class _BigTopicsWiki(MockWiki):
+    def get_topics(self):
+        return [f"topic-number-{i}" for i in range(60)]
+
+
+def test_long_command_output_is_chunked_with_more():
+    tmpdir = tempfile.mkdtemp(prefix="delfi-test-")
+    router = Router(_make_cfg(tmpdir), _BigTopicsWiki(), MockPeerCache(), MockGossipDir())
+    msgs = router.route_multi("!a", "!topics")
+    assert len(msgs) == 3 and msgs[-1].endswith("[!more]")
+    rest = router.route("!a", "!more")
+    assert "topic-number" in rest
+    everything = " ".join(msgs) + " " + rest
+    assert "topic-number-0" in everything
+
+
+def test_board_output_splits_on_post_boundaries():
+    from del_fi.core.formatter import byte_len
+    router = _make_router(board_enabled=True, board_persist=False, board_rate_limit=100)
+    for i in range(5):
+        router.route("!poster", f"!post Post {i}: " + "news " * 30)
+    msgs = router.route_multi("!reader", "!board")
+    assert len(msgs) >= 2
+    for m in msgs:
+        assert byte_len(m) <= 230
+        assert m.startswith("[!post ")  # each message starts at a post
+
+
+# --- v0.3: response cache isolation ---
+
+
+def test_cache_not_shared_when_sender_has_history():
+    class HistoryWiki(MockWiki):
+        def query(self, text, peer_ctx="", history="", board_context=""):
+            return (f"Answer using: {history[-40:]}" if history else "No history."), True
+
+    router = _router_with(HistoryWiki(), memory_max_turns=5, memory_ttl=3600)
+    router.route("!alice", "my campsite is 14B near the creek")
+    router.route("!alice", "remind me what I said")
+    bob = router.route("!bob", "remind me what I said")
+    assert "14B" not in bob
+
+
+def test_cache_used_for_history_free_questions():
+    wiki = _ScriptedWiki("First answer.", "Second answer.")
+    router = _router_with(wiki)
+    a = router.route("!a", "Where is the trailhead?")
+    b = router.route("!b", "where is the trailhead")  # normalised key
+    assert "First answer." in a and "First answer." in b
+    assert len(wiki.calls) == 1
+
+
+def test_cache_keeps_peer_provenance():
+    class PeerOnlyWiki(MockWiki):
+        def query(self, text, peer_ctx="", history="", board_context=""):
+            return "", False
+
+    class OnePeer(MockPeerCache):
+        def lookup(self, query):
+            return {"peer_name": "MARINA-ORACLE", "response": "Limit is 6 bass per day."}
+
+    tmpdir = tempfile.mkdtemp(prefix="delfi-test-")
+    router = Router(_make_cfg(tmpdir), PeerOnlyWiki(), OnePeer(), MockGossipDir())
+    first = router.route("!a", "bass limit?")
+    again = router.route("!b", "bass limit?")
+    assert first.startswith("[via MARINA-ORACLE]")
+    assert again.startswith("[via MARINA-ORACLE]")
+
+
+def test_cache_size_is_capped():
+    from del_fi.core import router as router_mod
+    router = _router_with(MockWiki())
+    for i in range(router_mod.MAX_CACHE_ENTRIES + 25):
+        router._cache_response(f"question {i}", "answer")
+    assert len(router._response_cache) == router_mod.MAX_CACHE_ENTRIES
+    assert router._check_cache(f"question {router_mod.MAX_CACHE_ENTRIES + 24}")
+
+
+def test_flush_cache_round_trip():
+    tmpdir = tempfile.mkdtemp(prefix="delfi-test-")
+    cfg = _make_cfg(tmpdir, persistent_cache=True)
+    r1 = Router(cfg, MockWiki(), MockPeerCache(), MockGossipDir())
+    r1._cache_response("Where is camp?", "By the lake.", "PEER-X")
+    r1.flush_cache()
+    r2 = Router(cfg, MockWiki(), MockPeerCache(), MockGossipDir())
+    assert r2._check_cache("where is camp") == ("By the lake.", "PEER-X")
+
+
+# --- v0.3: honest replies when the LLM fails ---
+
+
+def test_llm_unreachable_is_reported_honestly():
+    from del_fi.core.knowledge import LLMError
+    router = _router_with(_ScriptedWiki(LLMError("unavailable", "refused")))
+    reply = router.route("!a", "where are the elk")
+    assert "language model" in reply and "don't have" not in reply
+
+
+def test_llm_timeout_suggests_retry():
+    from del_fi.core.knowledge import LLMError
+    router = _router_with(_ScriptedWiki(LLMError("timeout")))
+    assert "!retry" in router.route("!a", "where are the elk")
+
+
+def test_llm_error_is_not_cached():
+    from del_fi.core.knowledge import LLMError
+    wiki = _ScriptedWiki(LLMError("error", "model not found"), "Real answer.")
+    router = _router_with(wiki)
+    router.route("!a", "where are the elk")
+    assert "Real answer." in router.route("!b", "where are the elk")
+
+
+# --- v0.3: !retry reaches the worker queue ---
+
+
+def test_retry_uses_query_queue_when_set():
+    import queue as queue_mod
+    wiki = _ScriptedWiki("First.", "Second.")
+    router = _router_with(wiki)
+    router.query_queue = queue_mod.Queue()
+    router.route("!a", "what is the trail like")
+    assert router.route("!a", "!retry") == "Retrying..."
+    assert router.query_queue.get_nowait() == ("!a", "what is the trail like")
+    assert len(wiki.calls) == 1  # not re-run inline
+
+
+def test_retry_inline_bypasses_cache():
+    wiki = _ScriptedWiki("First.", "Second.")
+    router = _router_with(wiki)
+    router.route("!a", "what is the trail like")
+    assert "Second." in router.route("!a", "!retry")
+
+
+# --- v0.3: first-contact footer ---
+
+
+def test_footer_not_added_to_multi_chunk_answer():
+    router = _router_with(_ScriptedWiki(_LONG))
+    msgs = router.route_multi("!new", "tell me everything")
+    assert not any("Del-Fi oracle" in m for m in msgs)
+
+
+def test_footer_added_once_to_short_answer():
+    router = _router_with(_ScriptedWiki("Yes.", "No."))
+    assert "Del-Fi oracle" in router.route("!new", "is it open")
+    assert "Del-Fi oracle" not in router.route("!new", "is it closed")
+
+
 # ---------------------------------------------------------------------------
 # unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------

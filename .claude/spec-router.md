@@ -149,82 +149,73 @@ Returns: `"{node_name} online"`
 
 ## 3. Response Cache
 
-The response cache stores exact-match query → response pairs. It avoids repeated
-LLM inference for identical questions.
+Stores question → answer pairs so a repeated question skips the LLM.
 
 ### 3.1 Cache key
 
 ```python
-cache_key = query_text.strip().lower()
+cache_key = " ".join(query.lower().split()).strip(" ?!.,;:")
 ```
 
-No fuzzy matching. Only exact-match after normalisation.
+Case, whitespace and trailing punctuation are normalised. No fuzzy matching.
 
-### 3.2 Cache storage
+### 3.2 When the cache is used
 
-In-memory dict + disk persistence (JSON file at `cache/response_cache.json`).
-Loaded from disk on startup. Flushed to disk by background thread every
-60 seconds and on clean shutdown.
+- Only for questions asked **without conversation history**. When memory is
+  enabled and the sender has history, the answer depends on that history, so
+  it is neither read from nor written to the shared cache — otherwise one
+  sender's conversation could be served to another.
+- Tier 0 (facts) bypasses the cache: freshness is the point.
+- Populated with Tier 1 and Tier 2 answers. Fallbacks, referrals and error
+  replies are never cached.
+- `!retry` evicts the sender's last question before re-running it.
+- Commands neither read nor populate the cache.
 
-### 3.3 Cache entry format
+### 3.3 Storage
 
-```python
-{
-    "query_lower": {
-        "response": "Answer text...",
-        "timestamp": 1714000000.0,   # Unix timestamp
-        "sender": "!a1b2c3d4",       # last sender (informational, for log)
-    }
-}
+In memory, capped at 100 entries (expired entries dropped first, then the
+oldest). Persisted to `cache/response_cache.json` every 60 s when dirty and on
+shutdown, via an atomic write:
+
+```json
+{"where is the trailhead": {"response": "…", "provenance": null, "ts": 1714000000.0}}
 ```
+
+`provenance` holds the peer name for Tier 2 answers, so a cached peer answer
+is still labelled `[via PEER]` when served again.
 
 ### 3.4 TTL
 
-Config key: `cache_ttl_seconds` (default: 300).
-
-On cache lookup:
-
-```python
-if time.time() - entry["timestamp"] > self._cache_ttl:
-    del self._cache[cache_key]
-    return None
-```
-
-### 3.5 Cache bypass
-
-- `!retry` command: bypasses cache and re-runs the LLM query.
-- Cache is populated at the end of every successful query-worker run.
-- Commands do not use or populate the response cache.
+Config key: `response_cache_ttl` (default: 300 seconds).
 
 ---
 
 ## 4. `!more` Buffer
 
-Stores the last full (untruncated) response per sender so follow-up chunks can
-be retrieved.
+### 4.1 Lifecycle
 
-### 4.1 Data structure
+1. An answer or command output longer than one message is split into chunks
+   (`format_response()` for answers; line-aware `paginate()` for command
+   output, so board posts and sensor lines are not cut mid-line) and stored
+   as the sender's buffer.
+2. The first `auto_send_chunks` (default 3) chunks are sent immediately. If
+   more remain, the last auto-sent chunk ends with ` [!more]`.
+3. Extra chunks are only ever auto-sent from a buffer created by the current
+   message — never from an older answer still in the buffer.
+4. A new **answer** always replaces or clears the sender's buffer. Short
+   **command** output leaves it alone, so `!status` between two `!more`s does
+   not lose the pending answer; long command output replaces it.
+5. `!more` → exactly one next chunk. `!more N` → re-send chunk N (1-indexed),
+   for chunks lost on a lossy mesh.
+6. Buffers expire 10 minutes after the last `!more`.
 
-```python
-# per sender: {"full_text": str, "chunks": list[str], "timestamp": float}
-_more_buffers: dict[str, dict] = {}
-```
+### 4.2 Replies
 
-### 4.2 Lifecycle
-
-1. When `Formatter.chunk(response)` returns > 1 chunks, store them in `_more_buffers[sender]`.
-2. Auto-send the first `auto_send_chunks` (config default: 3) chunks.
-3. If more chunks remain, append indicator to last auto-sent chunk:
-   `" +{N} !more"` where N is remaining chunk count. This must fit within 230 bytes.
-4. `!more` without argument → send next unsent chunk (increment internal cursor).
-5. `!more N` → re-send chunk N (1-indexed). Handles packet loss on lossy channels.
-6. Buffer expires after `more_buffer_ttl_seconds` (default: 600 = 10 minutes).
-7. After last chunk is sent, respond: `"[End of response]"`
-
-### 4.3 `!more` with no buffer
-
-If sender has no active buffer (expired or never set):
-`"No queued response. Send a query first."`
+| Situation | Reply |
+|-----------|-------|
+| No buffer (never set or expired) | `No pending response. Send a question first.` |
+| All chunks sent | `End of response. No more chunks.` |
+| `!more N` out of range | `No chunk N. Response has M parts.` |
 
 ---
 
@@ -285,56 +276,54 @@ See `.claude/claude.md §7` for the overview. Router-specific detail:
 
 ### 6.1 Tier 0 — FactStore
 
+`facts.lookup(query)` is a keyword match, not a semantic search. When it
+returns a reading, that string is the answer: no LLM call, no cache.
+
+### 6.2 Response cache, then Tier 1 — WikiEngine
+
 ```python
-fact = self._fact_store.lookup(query)
-if fact:
-    return fact    # no LLM call
+answer, had_context = wiki.query(query, history=history, board_context=board_ctx)
 ```
 
-`lookup()` is a keyword match, not a semantic search. If any keyword from
-`fact_query_keywords` config list appears in the normalised query, FactStore
-returns the relevant sensor reading. Fast path: no Ollama call, no disk I/O.
+`had_context=False` means no wiki page matched, or the model declined to
+answer from the pages it was given; the router falls through to Tier 2.
+If Ollama is not available, the reply says so honestly (no tiers are tried).
 
-### 6.2 Tier 1 — WikiEngine
+### 6.3 Generation failures
+
+`wiki.query()` raises `LLMError` when generation fails. The router never
+turns a failure into "I don't have docs on that":
+
+| `LLMError.kind` | Cause | Reply |
+|-----------------|-------|-------|
+| `unavailable` | Ollama unreachable (also marks it down so the health loop takes over) | "My language model isn't reachable right now…" |
+| `timeout` | Model too slow for `ollama_timeout` | "That took too long… or !retry in a minute." |
+| `error` | Anything else (e.g. model not pulled) | "I hit an error answering that…" |
+
+### 6.4 Tier 2 — PeerCache
 
 ```python
-answer, source = self._wiki_engine.query(
-    query,
-    peer_context=peer_ctx,          # injected if Tier 2 had partial match
-    history=self._memory.get_context(sender),
-)
-if answer:                          # non-empty, non-fallback response
-    self._response_cache[cache_key] = answer
-    return answer
+peer = peer_cache.lookup(query)
+if peer:
+    return peer["response"], peer["peer_name"]   # rendered as "[via NODE] …"
 ```
 
-### 6.3 Tier 2 — PeerCache
+The peer's answer is returned as-is with its provenance label; there is no
+second LLM call to re-synthesise it.
+
+### 6.5 Tier 3 — GossipDirectory
 
 ```python
-peer_answer = self._peer_cache.lookup(query)
-if peer_answer:
-    return peer_answer   # already contains "[via NODE]" label
-```
-
-If no direct match but a partial match exists, pass `peer_ctx` to Tier 1 query
-(see §6.2 above).
-
-### 6.4 Tier 3 — GossipDirectory
-
-```python
-referral = self._gossip_dir.referral(query)
+referral = gossip_dir.referral(query)
 if referral:
     return referral      # e.g. "Try VALLEY-ORACLE — covers fishing, lake-levels"
 ```
 
-### 6.5 Fallback
+### 6.6 Fallback
 
-```python
-return self._config.get(
-    "fallback_message",
-    "I don't have docs on that. Try !topics."
-)
-```
+The `fallback_message` config value if set; otherwise a suggestion listing
+known topics (`wiki.suggest()`); otherwise
+`"<NODE>: I don't have docs on that. Try !topics to see what I know."`
 
 ---
 
@@ -387,18 +376,17 @@ def referral(self, query: str) -> str | None:
 
 ## 8. "Seen Senders" First-Contact Tracking
 
-The first time a sender contacts the node, the response appends a welcome footer
-(if one is configured). This is tracked in `seen_senders.txt` (one ID per line),
-loaded on startup, flushed on clean shutdown.
+A sender's first single-message answer gets a footer:
 
-Config key: `welcome_footer` (default: empty string → no footer appended).
-
-```yaml
-welcome_footer: "New here? Try !help"
+```
+---
+Del-Fi oracle · 12 pages · !help !topics
 ```
 
-The footer is appended within the 230-byte budget. If the response + footer would
-exceed 230 bytes, the footer is omitted (silently).
+The footer is only added when the answer plus footer fits in one message; the
+sender is marked as seen once they have received the footer (or the greeting
+reply to "hi"/"hello"). Seen IDs are stored one per line in
+`seen_senders.txt`, rewritten atomically on each new sender.
 
 ---
 

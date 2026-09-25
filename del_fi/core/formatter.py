@@ -151,6 +151,9 @@ def format_response(
         else:
             text = truncate_at_sentence(text, max_bytes)
 
+    if byte_len(text) <= max_bytes:
+        return text, [text], False
+
     chunks = chunk_text(text, max_bytes - MORE_TAG_BYTES)
 
     if len(chunks) == 1:
@@ -161,3 +164,55 @@ def format_response(
 
     first = chunks[0] + MORE_TAG
     return first, chunks, True
+
+
+def chunk_lines(text: str, max_bytes: int) -> list[str]:
+    """Pack whole lines into chunks of at most max_bytes.
+
+    Lines longer than max_bytes are split with chunk_text(). Used for
+    command output (board posts, sensor readings), where a line is the
+    natural unit and should not be cut in the middle when avoidable.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if byte_len(line) > max_bytes:
+            if current:
+                chunks.append(current)
+            pieces = chunk_text(line, max_bytes)
+            chunks.extend(pieces[:-1])
+            current = pieces[-1] if pieces else ""
+            continue
+        candidate = f"{current}\n{line}" if current else line
+        if byte_len(candidate) <= max_bytes:
+            current = candidate
+        else:
+            chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def paginate(text: str, max_bytes: int = 230) -> tuple[str, list[str], bool]:
+    """Chunk plain command output for LoRa, preferring line boundaries.
+
+    Unlike format_response(), no markdown is stripped: command output is
+    already plain text, and user-written board posts must not be altered.
+
+    Returns:
+        (first_message, all_chunks, is_truncated)
+    """
+    text = text.strip()
+    if not text:
+        return "(no response)", ["(no response)"], False
+    if byte_len(text) <= max_bytes:
+        return text, [text], False
+    chunks = chunk_lines(text, max_bytes - MORE_TAG_BYTES)
+    if len(chunks) <= 1:
+        final = truncate_at_sentence(text, max_bytes)
+        return final, [final], False
+    return chunks[0] + MORE_TAG, chunks, True
