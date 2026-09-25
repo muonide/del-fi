@@ -49,11 +49,19 @@ class MeshAdapter(ABC):
 
     # --- Optional overrides ---
 
-    def reconnect_loop(self) -> None:
-        """Background thread body: keep retrying ``connect``.
+    def send_broadcast(self, text: str, channel_index: int = 0) -> bool:
+        """Broadcast *text* on a channel (used for gossip announcements).
 
-        The default implementation is a no-op.  Override if your
-        protocol can recover from a dropped connection.
+        The default reports "unsupported" by returning False.
+        """
+        return False
+
+    def reconnect_loop(self) -> None:
+        """Background thread body: keep the link up for the daemon's life.
+
+        Started once at daemon startup and expected to reconnect whenever
+        the connection drops, not only when the first connect() failed.
+        The default implementation is a no-op.
         """
 
     @property

@@ -194,8 +194,11 @@ def run_daemon(cfg: dict, simulator: bool):
         mesh_iface.connect()  # starts the stdin chat prompt
     else:
         if not mesh_iface.connect():
-            log.warning("radio not connected — entering reconnect loop")
-            threading.Thread(target=mesh_iface.reconnect_loop, daemon=True).start()
+            log.warning("radio not connected — will keep retrying")
+        # Supervisor: reconnects whenever the link drops, for the daemon's life.
+        threading.Thread(
+            target=mesh_iface.reconnect_loop, name="radio-supervisor", daemon=True
+        ).start()
         print_banner(cfg, wiki, mesh_iface, gossip_dir)
 
     # Stop event for all background threads

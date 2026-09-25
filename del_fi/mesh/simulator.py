@@ -79,6 +79,12 @@ class SimulatorAdapter(MeshAdapter):
         print(f"  \033[32m{node}\033[0m \033[90m[{ts}] ➜ {dest_id}\033[0m {text}\n")
         return True
 
+    def send_broadcast(self, text: str, channel_index: int = 0) -> bool:
+        ts = time.strftime("%H:%M")
+        node = self.cfg["node_name"]
+        print(f"  \033[35m{node}\033[0m \033[90m[{ts}] ➜ broadcast ch{channel_index}\033[0m {text}\n")
+        return True
+
     @property
     def connected(self) -> bool:
         return self._should_run
