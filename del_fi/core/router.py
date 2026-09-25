@@ -492,7 +492,10 @@ class Router:
             self._more_buffers.pop(sender_id, None)
             first_contact = sender_id not in self._seen_senders
         if first_contact:
-            footer = f"\n---\nDel-Fi oracle · {self.wiki.page_count} pages · !help !topics"
+            text = self.cfg.get("welcome_footer") or (
+                f"Del-Fi oracle · {self.wiki.page_count} pages · !help !topics"
+            )
+            footer = f"\n---\n{text}"
             if byte_len(first_msg + footer) <= max_bytes:
                 first_msg += footer
                 self._mark_seen(sender_id)

@@ -23,8 +23,9 @@ A community hub oracle for Maplewood, a residential neighborhood in the Pacific 
 ## Suggested config.yaml
 
 ```yaml
+# Community oracle for the Maplewood neighborhood: local services,
+# infrastructure, events, and organizations.
 node_name: "MAPLEWOOD-ORACLE"
-node_description: "Community oracle for Maplewood neighborhood. Ask about local services, infrastructure, events, and organizations."
 oracle_type: "community-hub"
 
 model: "gemma4:4b"
@@ -33,7 +34,7 @@ wiki_builder_model: "gemma4:12b"
 knowledge_folder: ./knowledge
 wiki_folder: ./wiki
 
-# These files change frequently — wiki pages get freshness headers at query time
+# These files change frequently — their passages get freshness headers at query time
 time_sensitive_files:
   - infrastructure.md
   - community-log.md
@@ -41,17 +42,19 @@ time_sensitive_files:
 # Community log changes often (new entries appended); flag as stale quickly
 wiki_stale_after_days: 14
 
-# Watch for file changes and patch the wiki incrementally using the serving model
+# Recompile changed files (with the serving model) and drop deleted ones
 wiki_watch_enabled: true
-wiki_patch_threshold_pct: 40
 
 fallback_message: "I don't have that info. Try !topics to see what I know, or ask at the library desk."
 welcome_footer: "MAPLEWOOD-ORACLE — ask about local resources, events, and infrastructure."
 
-trusted_peers:
-  - "EASTSIDE-RELAY"
-  - "GARFIELD-NODE"
-  - "MILLBROOK-SENSOR"
+# Hear neighboring Del-Fi nodes and refer questions to them
+mesh_knowledge:
+  gossip:
+    enabled: true
+  # peers:                     # trust by hardware node ID, exchanged in person
+  #   - node_id: "!a1b2c3d4"
+  #     name: "EASTSIDE-RELAY"
 
 fact_query_keywords:
   - creek level
@@ -61,7 +64,7 @@ fact_query_keywords:
   - power out
   - outage
 
-mesh_adapter: meshtastic
+mesh_protocol: meshtastic
 ```
 
 ---
@@ -140,7 +143,7 @@ The library rooftop gives excellent line-of-sight to most of the neighborhood. T
 To use this template for a different community hub:
 1. Replace all knowledge files with content relevant to your neighborhood
 2. Update `node_name` in config.yaml
-3. Update `trusted_peers` to reflect your actual neighboring nodes
+3. Update `mesh_knowledge` (gossip, and `peers` by node ID) to reflect your actual neighboring nodes
 4. Update `fact_query_keywords` to match the environmental data your node tracks
 5. Run `--build-wiki` with the builder model before going live
 6. Run `--lint-wiki` to verify the wiki is healthy before deployment

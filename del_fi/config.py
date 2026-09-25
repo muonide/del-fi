@@ -20,6 +20,7 @@ DEFAULTS: dict = {
     "model": "gemma4:4b",
     "personality": "You are a helpful and concise community assistant.",
     "fallback_message": "",              # empty: suggest known topics instead
+    "welcome_footer": "",                # first-contact footer; empty = built-in
     "knowledge_folder": "./knowledge",
     # --- Wiki ---
     "wiki_folder": "./wiki",
@@ -178,7 +179,7 @@ class ConfigError(Exception):
 
 # Keys accepted at the top level besides DEFAULTS (warned about otherwise).
 _EXTRA_KEYS = frozenset({
-    "node_name", "mesh_knowledge", "meshcore", "oracle_type", "node_description",
+    "node_name", "mesh_knowledge", "meshcore", "oracle_type",
     # v0.2 names, mapped into mesh_knowledge with their own warning
     "trusted_peers", "peer_cache_ttl", "max_cache_entries", "gossip_announce_interval",
 })

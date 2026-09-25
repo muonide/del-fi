@@ -1,6 +1,6 @@
 # Del-Fi — Project Specification
 
-<!-- Version: 0.2 | Date: 2026-04-22 -->
+<!-- Version: 0.3 | Date: 2026-09-25 -->
 <!-- Authoritative spec for all Del-Fi development. -->
 <!-- Sub-specs: .claude/spec-*.md | Brand: .claude/brand.md -->
 <!-- AI agent onboarding: .github/COPILOT.md -->
@@ -18,7 +18,7 @@
 7. [Tier Hierarchy](#7-tier-hierarchy)
 8. [Command Registry](#8-command-registry)
 9. [Configuration Summary](#9-configuration-summary)
-10. [Project Layout (Target)](#10-project-layout-target)
+10. [Project Layout](#10-project-layout)
 11. [Development Conventions](#11-development-conventions)
 12. [Testing Contract](#12-testing-contract)
 13. [Sub-Spec Index](#13-sub-spec-index)
@@ -82,10 +82,14 @@ must have a local fallback or graceful degradation path.
 Del-Fi must **refuse to answer from the LLM's training knowledge** when the
 question cannot be answered from the local knowledge base.
 
-- If retrieval returns nothing above threshold: return `fallback_message` config
-  value, not an LLM-fabricated answer.
-- System prompt explicitly instructs the LLM: answer **only** from the provided
-  context. If the context doesn't contain the answer, say "I don't know."
+- If retrieval finds nothing: the next tier answers, and finally the
+  `fallback_message` (or a list of known topics) — never an LLM-fabricated answer.
+- The system prompt instructs the LLM to answer **only** from the provided
+  excerpts; when they don't directly answer, it may share the closest relevant
+  facts they contain and say what they cover. A bare refusal ("I don't know")
+  falls through to the next tier.
+- If the LLM itself fails, the node says so ("my language model isn't
+  reachable") — it never reports a failure as "I don't have docs on that".
 - Sensor facts (FactStore Tier 0) are ground truth; the LLM does not reason
   about them — they are inserted as-is into the response.
 - Peer-cached answers (Tier 2) are always labelled with the source node.
@@ -119,11 +123,12 @@ question cannot be answered from the local knowledge base.
                                              MeshAdapter.send_dm()
 ```
 
-### 3.1 Concurrency Model (current — v0.1 / v0.2)
+### 3.1 Concurrency Model
 
-Threading-based. Main thread runs the dispatcher; a worker thread handles slow
-LLM queries via `threading.Queue`. Background threads: knowledge watcher, Ollama
-health check, cache flush, fact watcher, peer sync.
+Threading-based. The main thread runs the `Dispatcher` loop; one worker thread
+answers questions (one LLM call at a time). Background threads: radio
+supervisor (reconnect), wiki watcher, Ollama health check, maintenance (cache
+flush, memory expiry), fact watcher, gossip announcer (when enabled).
 
 > **Note:** An asyncio rewrite is planned as Phase 3. Until then, all concurrency
 > uses `threading` + `queue.Queue`. Do not introduce `asyncio` into the current
@@ -134,24 +139,26 @@ health check, cache flush, fact watcher, peer sync.
 ```
                     ┌──────────────────────────────────────────────┐
 receive DM          │ Dispatcher (main thread)                     │
-sender + text  ───► │  1. rate-limit check (freeform queries only) │
-                    │  2. classify: command | gossip | query | empty│
-                    │  3a. command  → inline handler → send        │
-                    │  3b. gossip   → mesh_knowledge.receive()     │
-                    │  3c. query    → msg_queue.put()              │
+sender + text  ───► │  classify: command | gossip | query | empty  │
+                    │  command → router inline → send              │
+                    │  gossip  → gossip directory (no reply)       │
+                    │  query / !retry → rate limit → bounded queue │
                     └──────────────────────────────────────────────┘
-                                        │ msg_queue
+                                        │ query_queue
                     ┌───────────────────▼──────────────────────────┐
-                    │ query_worker (thread)                         │
-                    │  1. check response_cache (exact match)       │
+                    │ worker thread → Router                       │
+                    │  1. first-contact greeting ("hi")            │
                     │  2. Tier 0: FactStore.lookup(query)          │
-                    │  3. Tier 1: WikiEngine.query(query)          │
-                    │  4. Tier 2: PeerCache.lookup(query)          │
-                    │  5. Tier 3: GossipDir.referral(query)        │
-                    │  6. fallback_message                         │
-                    │  7. cache result, chunk, send                │
+                    │  3. response cache (history-free questions)  │
+                    │  4. Tier 1: WikiEngine.query(query)          │
+                    │  5. Tier 2: PeerCache.lookup(query)          │
+                    │  6. Tier 3: GossipDirectory.referral(query)  │
+                    │  7. fallback_message / known topics          │
+                    │  8. format, chunk, auto-send ≤3, !more rest  │
                     └──────────────────────────────────────────────┘
 ```
+
+Full detail: `.claude/spec-router.md`.
 
 ---
 
@@ -241,14 +248,18 @@ claim replaces it and the old text is annotated:
 
 ### 4.7 Query Pipeline (Tier 1)
 
-1. Extract keywords from the query (stop-word filtered).
-2. BM25 keyword search on `wiki/index.md` titles + tags → ranked page list.
-3. Read top 2–3 wiki pages as context.
-4. Optionally: vector search ChromaDB index of wiki pages for semantic fallback.
-5. Assemble context string and pass to serving LLM (`model`).
+1. Find pages: BM25 over `wiki/index.md` rows (slug, summary, tags), then
+   ChromaDB similarity over page embeddings, then whole-word search of page
+   bodies. Keep the top 3.
+2. Split those pages' **source files** into section passages and rank them
+   against the question (BM25, weighted by page rank).
+3. Fill the context budget (`max_context_tokens`) best-first; output in
+   document order per page.
+4. Generate with the serving model (`model`), with a fixed `num_ctx`.
 
-ChromaDB is retained, but now embeds **whole wiki pages** (not raw document chunks).
-The corpus is smaller; signal is better; a 1B model can parse it without overflow.
+The wiki is the *index*; the raw sources are what the model reads — but only
+the passages that matter, so a 1B model on a Pi gets a few hundred tokens,
+not whole files. Full detail: `.claude/spec-knowledge.md §7`.
 
 ### 4.8 Staleness
 
@@ -281,6 +292,9 @@ python main.py --lint-wiki [--config PATH]
 # Simulator mode — no radio hardware, stdin/stdout
 python main.py --simulator [--config PATH]
 # Supports sender prefix: !a1b2c3d4> message text
+
+# Web control panel (localhost only)
+python main.py --gui [--config PATH] [--gui-port 5174] [--no-browser]
 ```
 
 `--build-wiki` and `--lint-wiki` are non-destructive, offline operations.
@@ -290,52 +304,41 @@ They do not start the radio listener. They are safe to re-run at any time.
 
 ## 6. Module Responsibilities
 
-### Current layout (v0.1 — root-level files)
+### Layout (v0.3)
 
 | File | Class | Responsibility |
 |------|-------|----------------|
-| `delfi.py` | — | Entrypoint, background threads, startup sequence |
-| `router.py` | `Router` | Message classification, command dispatch, tier routing |
-| `rag.py` | `RAGEngine` | ChromaDB + Ollama, document chunking, vector retrieval (being replaced) |
-| `meshknowledge.py` | `MeshKnowledge` | Peer cache (SQLite) + gossip directory |
-| `memory.py` | `ConversationMemory` | Per-sender ring buffer with TTL |
-| `board.py` | `MessageBoard` | Community message board, rate limiting, injection filter |
-| `facts.py` | `FactStore` | Sensor feed polling, freshness, Tier 0 fast path |
-| `formatter.py` | `Formatter` | 230-byte enforcement, markdown stripping, chunking |
-| `config.py` | — | YAML loading, validation, oracle profile application |
-| `mesh/base.py` | `MeshAdapter` | Abstract adapter interface |
-| `mesh/meshtastic_adapter.py` | `MeshtasticAdapter` | Production Meshtastic driver |
-| `mesh/meshcore_adapter.py` | `MeshCoreAdapter` | MeshCore stub (awaiting library) |
-| `mesh/simulator.py` | `SimulatorAdapter` | stdin/stdout for development |
-
-### Target layout (v0.2 — after Phase 2 restructuring)
-
-| File | Class | Notes |
-|------|-------|-------|
-| `main.py` | — | Replaces `delfi.py`; adds `--build-wiki`, `--lint-wiki` |
-| `del_fi/config.py` | — | Moved from root |
-| `del_fi/core/knowledge.py` | `WikiEngine` | Replaces `rag.py`; owns build, query, lint |
-| `del_fi/core/peers.py` | `PeerCache`, `GossipDirectory` | Split from `meshknowledge.py` |
-| `del_fi/core/router.py` | `Router` | Moved from root |
-| `del_fi/core/formatter.py` | `Formatter` | Moved from root |
-| `del_fi/core/memory.py` | `ConversationMemory` | Moved from root |
-| `del_fi/core/board.py` | `MessageBoard` | Moved from root |
-| `del_fi/core/facts.py` | `FactStore` | Moved from root |
-| `del_fi/mesh/*.py` | — | Moved from root `mesh/` |
+| `main.py` | — | Entrypoint: daemon wiring, `--simulator`, `--build-wiki`, `--lint-wiki`, `--gui` |
+| `del_fi/config.py` | — | YAML loading, validation, defaults, oracle profiles |
+| `del_fi/core/dispatcher.py` | `Dispatcher` | Main loop: classify, rate limit, bounded queue, worker |
+| `del_fi/core/router.py` | `Router` | Commands, tier hierarchy, response cache, `!more` buffers |
+| `del_fi/core/knowledge.py` | `WikiEngine` | Wiki build, passage retrieval, lint, watcher |
+| `del_fi/core/formatter.py` | — | 230-byte enforcement, markdown stripping, chunking |
+| `del_fi/core/facts.py` | `FactStore` | Sensor feed, freshness, Tier 0 |
+| `del_fi/core/peers.py` | `PeerCache`, `GossipDirectory` | Tier 2 storage, Tier 3 gossip |
+| `del_fi/core/memory.py` | `ConversationMemory` | Per-sender history with TTL |
+| `del_fi/core/board.py` | `Board` | Community board, rate limiting, injection filter |
+| `del_fi/core/text.py`, `fsutil.py` | — | Shared tokenizer; atomic fsync'd writes |
+| `del_fi/mesh/base.py` | `MeshAdapter` | Abstract adapter interface |
+| `del_fi/mesh/meshtastic_adapter.py` | `MeshtasticAdapter` | Meshtastic driver with reconnect supervisor |
+| `del_fi/mesh/meshcore_adapter.py` | `MeshCoreAdapter` | MeshCore stub |
+| `del_fi/mesh/simulator.py` | `SimulatorAdapter` | stdin/stdout for development |
+| `del_fi/gui/server.py` | — | Optional Flask control panel (localhost) |
 
 ### Module contracts
 
 | Module | Key public methods |
 |--------|-------------------|
-| `WikiEngine` | `build(file=None)`, `patch(file) → dict`, `query(q, peer_ctx="", history="") → (str, str)`, `lint() → list[str]`, `watch(interval)` |
-| `PeerCache` | `lookup(q) → str|None`, `store(q, answer, peer_id)`, `prune()` |
-| `GossipDirectory` | `receive(announcement)`, `referral(q) → str|None`, `announce() → str` |
-| `Router` | `handle(sender, text) → str` |
-| `Formatter` | `format(text) → str`, `chunk(text) → list[str]` |
-| `ConversationMemory` | `add(sender, user, asst)`, `get_context(sender) → str`, `forget(sender)` |
-| `MessageBoard` | `post(sender, text) → str`, `read(query="") → str`, `unpost(sender) → str` |
-| `FactStore` | `watch()`, `lookup(query) → str|None`, `snapshot() → str` |
-| `MeshAdapter` | `connect()`, `send_dm(dest, text)`, `close()`, `reconnect_loop()` (optional) |
+| `Dispatcher` | `start()`, `run(inbox)`, `handle(sender, text)`, `stop()` |
+| `Router` | `classify(text)`, `route(sender, text) → str|None`, `route_multi(sender, text) → list[str]|None`, `prepare_retry(sender)`, `flush_cache()` |
+| `WikiEngine` | `build(file=None, model=None) → int`, `prune_removed_sources()`, `query(q, peer_ctx="", history="", board_context="") → (str, bool)` (raises `LLMError`), `lint() → list[str]`, `watch(interval, stop)` |
+| `formatter` | `format_response(text, max_bytes, provenance) → (first, chunks, truncated)`, `paginate(...)`, `chunk_text(...)` |
+| `PeerCache` | `lookup(q) → dict|None`, `store(q, answer, peer_id, peer_name) → bool`, `prune()` |
+| `GossipDirectory` | `receive(node_id, text) → bool`, `referral(q) → str|None`, `announce() → str`, `announce_loop(send_broadcast, stop)` |
+| `ConversationMemory` | `add_turn(sender, user, asst)`, `format_for_prompt(sender) → str`, `clear(sender)` |
+| `Board` | `post(sender, text) → str`, `read(query="") → str`, `clear(sender) → str`, `format_for_context(query, max_posts) → str` |
+| `FactStore` | `watch(stop)`, `lookup(query) → str|None`, `format_snapshot() → str` |
+| `MeshAdapter` | `connect() → bool`, `send_dm(dest, text) → bool`, `send_broadcast(text, channel) → bool`, `close()`, `reconnect_loop()` |
 
 ---
 
@@ -356,21 +359,21 @@ Tier 1 — WikiEngine (local compiled knowledge)
   Fallback:  if similarity below threshold, continue to Tier 2
 
 Tier 2 — PeerCache (trusted peer Q&A)
-  Condition: Tier 1 similarity below threshold AND peer cache non-empty
-  Action:    return cached answer with source label "[via PEER-NODE]"
-  Source:    SQLite cache, populated by peer sync (nightly) or real-time gossip
-  Trust:     only stores answers from nodes in trusted_peers config list
+  Condition: Tier 1 had no context AND a cached peer answer matches
+  Action:    return that answer as-is, labelled "[via PEER-NODE]"
+  Source:    SQLite cache; only node IDs in mesh_knowledge.peers are trusted
+  Status:    storage built; the sync protocol that fills it is on the roadmap
 
 Tier 3 — GossipDirectory (referrals)
-  Condition: Tier 2 miss AND gossip directory has a matching-topic node
-  Action:    return referral "Try VALLEY-ORACLE — covers [topic]"
-  Source:    JSON gossip directory, built from mesh announcements (24hr TTL)
+  Condition: Tier 2 miss AND gossip is enabled AND a heard node's topics match
+  Action:    return "Try VALLEY-ORACLE (!a1b2c3d4) — covers [topics]"
+  Source:    gossip announcements (opt-in), keyed by sender node ID, 24 h TTL
   Note:      never transfers knowledge, only points to other nodes
 
 Fallback
   Condition: all tiers missed
   Action:    return fallback_message config value
-  Default:   "I don't have docs on that. Try !topics to see what I know."
+  Default:   a list of known topics, or "I don't have docs on that. Try !topics…"
 ```
 
 Commands bypass all tiers and run inline in the dispatcher thread.
@@ -394,7 +397,9 @@ Commands bypass all tiers and run inline in the dispatcher thread.
 | `!data` | — | Snapshot of all FactStore readings with ages |
 | `!ping` | — | Liveness check; responds with node name |
 
-All command responses pass through the Formatter before being sent.
+All command responses pass through the Formatter before being sent; long
+output (`!board`, `!topics`, `!data`, `!peers`) is split on line boundaries
+and continued with `!more`.
 
 ---
 
@@ -409,95 +414,77 @@ node_name: "RIDGELINE"
 model: "gemma3:4b-it-qat"
 ```
 
-**New in v0.2 (wiki system):**
+**Wiki system:**
 
 ```yaml
 wiki_folder: ./wiki                  # path to compiled wiki; default ./wiki
-wiki_builder_model: "qwen2.5:7b"     # model for --build-wiki (full synthesis); falls back to model
+wiki_builder_model: "qwen2.5:7b"     # model for --build-wiki; falls back to model
 wiki_rebuild_on_start: false         # run --build-wiki automatically at daemon startup
 wiki_stale_after_days: 30            # days before --lint-wiki flags a page as stale
-wiki_watch_enabled: true             # whether the file-watch background thread runs
-wiki_patch_model: ""                 # model for watch()-triggered incremental patches;
-                                     # defaults to model (serving model)
-wiki_patch_threshold_pct: 40         # if >40% of source lines changed, watch() routes to
-                                     # build() instead of patch()
+wiki_watch_enabled: true             # watcher: recompile changed files, drop deleted
+wiki_patch_model: ""                 # model the watcher uses; defaults to model
+max_context_tokens: 1500             # passage budget per answer
 ```
+
+**Dispatcher (v0.3):** `rate_limit_seconds`, `rate_limit_notice`,
+`query_queue_size`, `busy_notice`. **Peers & gossip:** the `mesh_knowledge`
+block (opt-in). All keys: `.claude/spec-config.md`.
 
 **Oracle profiles** — auto-applied by substring match on `model`:
 
 | Match | Parameters overridden |
 |-------|----------------------|
-| `gemma3:1b`, `llama3.2:1b` | `similarity_threshold: 0.35`, `rag_top_k: 2`, `max_context_tokens: 512`, `small_model_prompt: true`, `reorder_context: true` |
-| `gemma3:4b`, `qwen2.5:3b` | `similarity_threshold: 0.28`, `rag_top_k: 4` |
-| (no match) | Config values used as-is |
+| `gemma4:2b`, `gemma3:1b`, `llama3.2:1b` | `similarity_threshold: 0.35`, `rag_top_k: 2`, `max_context_tokens: 512`, `small_model_prompt: true`, `reorder_context: true` |
+| `gemma4:4b`, `gemma3:4b`, `qwen2.5:3b` | `similarity_threshold: 0.28`, `rag_top_k: 4` |
+| `gemma4:12b` | `similarity_threshold: 0.25`, `rag_top_k: 5`, `max_context_tokens: 3000` |
+| (no match) | Config values as-is |
 
 ---
 
-## 10. Project Layout (Target)
+## 10. Project Layout
 
 ```
 del-fi/
-├── main.py                      ← entrypoint (replaces delfi.py in Phase 2)
+├── main.py                      ← entrypoint
 ├── del_fi/                      ← importable package
-│   ├── __init__.py
+│   ├── __init__.py              ← __version__
 │   ├── config.py
 │   ├── core/
-│   │   ├── __init__.py
-│   │   ├── knowledge.py         ← WikiEngine (replaces rag.py)
-│   │   ├── peers.py             ← PeerCache + GossipDirectory
+│   │   ├── dispatcher.py        ← main loop, rate limit, worker
 │   │   ├── router.py
+│   │   ├── knowledge.py         ← WikiEngine
 │   │   ├── formatter.py
+│   │   ├── facts.py
+│   │   ├── peers.py             ← PeerCache + GossipDirectory
 │   │   ├── memory.py
 │   │   ├── board.py
-│   │   └── facts.py
-│   └── mesh/
-│       ├── __init__.py
-│       ├── base.py
-│       ├── meshtastic_adapter.py
-│       ├── meshcore_adapter.py
-│       └── simulator.py
-├── tests/
-│   ├── test_config.py
-│   ├── test_knowledge.py        ← replaces test_rag.py
-│   ├── test_router.py
-│   ├── test_formatter.py
-│   ├── test_memory.py
-│   ├── test_board.py
-│   ├── test_facts.py
-│   ├── test_mesh.py
-│   └── test_stress.py
+│   │   ├── text.py              ← shared tokenizer
+│   │   └── fsutil.py            ← atomic writes
+│   ├── mesh/
+│   │   ├── base.py
+│   │   ├── meshtastic_adapter.py
+│   │   ├── meshcore_adapter.py
+│   │   └── simulator.py
+│   └── gui/                     ← optional Flask control panel
+├── tests/                       ← one test_X.py per module, plus test_stress.py
 ├── knowledge/                   ← gitignored; deployment-specific raw sources
 ├── wiki/                        ← gitignored; LLM-compiled, rebuilt via --build-wiki
-├── examples/
-│   ├── GUIDE.md
-│   ├── RIDGELINE/               ← wilderness observatory template
-│   └── NEIGHBORHOOD/            ← community hub template
-├── docs/
-│   └── index.html               ← project landing page
+├── examples/                    ← GUIDE.md, RIDGELINE/, NEIGHBORHOOD/, knowledge-dungeon/,
+│                                   sensor_feed.example.json
+├── docs/index.html              ← project landing page
 ├── config.example.yaml          ← portable template; always commit
+├── CHANGELOG.md
 ├── requirements.txt
-├── .claude/                     ← always tracked
-│   ├── claude.md                ← this file
-│   ├── spec-knowledge.md
-│   ├── spec-mesh.md
-│   ├── spec-router.md
-│   ├── spec-formatter.md
-│   ├── spec-memory.md
-│   ├── spec-config.md
-│   └── brand.md
-├── .github/                     ← always tracked
-│   ├── COPILOT.md
-│   ├── CONTRIBUTING.md
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.md
-│       └── feature_request.md
+├── .claude/                     ← specs (always tracked)
+├── .github/                     ← COPILOT.md, CONTRIBUTING.md, ISSUE_TEMPLATE/, workflows/
 └── SECURITY.md
 ```
 
 **Principles:**
 - `del_fi/` is the importable package. `main.py` is the script entrypoint.
 - `core/` has no radio dependencies. `mesh/` imports from `core/`, not vice versa.
-- `tests/` mirrors `del_fi/` structure: `tests/test_X.py` tests `del_fi/core/X.py`.
+- `tests/` mirrors `del_fi/` structure: `tests/test_X.py` tests `del_fi/core/X.py`
+  (`test_mesh.py` covers `mesh/`, `test_gui.py` the GUI, `test_main.py` main.py).
 - `examples/` contains deployment templates — never imported at runtime.
 - `wiki/` and `knowledge/` are gitignored; they are per-deployment artifacts.
 - `.claude/` and `.github/` are always tracked in git.
@@ -573,7 +560,9 @@ del-fi/
 
 ### Conventions
 
-- Use `unittest` (stdlib). No pytest dependency.
+- Use `unittest` (stdlib). No pytest dependency. Bare `def test_...()` functions
+  are fine: each module ends with a `load_tests` hook (`tests/_support.py`)
+  that collects them, wherever they are defined in the file.
 - Mock Ollama calls at the HTTP level — no real inference in the test suite.
 - Mock ChromaDB with an in-memory collection.
 - Mock mesh radio with `SimulatorAdapter` pointing to a `StringIO` buffer.
@@ -590,14 +579,18 @@ del-fi/
 | `test_memory.py` | Ring buffer, TTL expiry, disk persistence |
 | `test_board.py` | Posting, rate limiting, content injection detection |
 | `test_facts.py` | Sensor feed parsing, freshness tracking, Tier 0 fast path |
-| `test_mesh.py` | Adapter interface contract, rate limiting, dedup |
+| `test_mesh.py` | Adapter contract, Meshtastic connect/reconnect, dedup, broadcasts |
+| `test_dispatcher.py` | Rate limit + notice, queue bound, busy notice, `!retry`, worker |
+| `test_peers.py` | Peer cache trust, gossip parsing, directory, referrals, announcer |
+| `test_gui.py` | Request guard, config merge/validation, board, sandbox (needs flask) |
+| `test_fsutil.py`, `test_main.py` | Atomic writes; log formatter |
 | `test_stress.py` | Concurrent queries, queue saturation, response time budget |
 
 ### Running tests
 
 ```bash
-# All tests (no hardware or Ollama required)
-python -m unittest discover tests/
+# All tests (no hardware or Ollama required; CI: Python 3.10–3.13)
+python -m unittest discover -s tests -t .
 
 # Single module
 python -m unittest tests.test_knowledge
@@ -609,9 +602,9 @@ python -m unittest tests.test_knowledge
 
 | Spec | File | Topics |
 |------|------|--------|
-| Knowledge System | `.claude/spec-knowledge.md` | LLM Wiki pattern, WikiEngine class, build pipeline, query pipeline, BM25, ChromaDB integration, staleness, lint, migration from rag.py |
-| Mesh Adapters | `.claude/spec-mesh.md` | MeshAdapter ABC, Meshtastic (serial/TCP/BLE), MeshCore stub, Simulator, rate limiting, dedup, reconnect |
-| Router | `.claude/spec-router.md` | Message classification, all commands (detailed), tier hierarchy, response cache, `!more` buffer, query worker |
+| Knowledge System | `.claude/spec-knowledge.md` | LLM Wiki pattern, WikiEngine class, build pipeline, query pipeline, BM25, ChromaDB integration, passage retrieval, context budget, staleness, lint, pruning, watcher |
+| Mesh Adapters | `.claude/spec-mesh.md` | MeshAdapter ABC, Meshtastic (serial/TCP/BLE), MeshCore stub, Simulator, dedup, reconnect supervisor |
+| Router | `.claude/spec-router.md` | Message classification, commands, tier hierarchy, response cache, `!more` buffer, Dispatcher (rate limit, queue, worker), gossip protocol |
 | Formatter | `.claude/spec-formatter.md` | 230-byte algorithm, truncation priority, UTF-8 safety, markdown stripping rules, chunking |
 | Memory / Board / FactStore | `.claude/spec-memory.md` | ConversationMemory ring buffer, MessageBoard injection filter, FactStore sensor schema, freshness lifecycle |
 | Configuration | `.claude/spec-config.md` | All config keys with types, defaults, validation, oracle profiles |
@@ -619,4 +612,4 @@ python -m unittest tests.test_knowledge
 
 ---
 
-<!-- End of Del-Fi Project Specification v0.2 -->
+<!-- End of Del-Fi Project Specification v0.3 -->

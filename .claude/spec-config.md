@@ -40,6 +40,7 @@ Every key is optional except `node_name`.
 | `node_name` | str | — (**required**) | `ALL-CAPS-HYPHENATED`. Appears in replies and gossip. |
 | `personality` | str | "You are a helpful and concise community assistant." | Added to the system prompt. |
 | `fallback_message` | str | `""` | Reply when every tier misses. Empty = list known topics instead. |
+| `welcome_footer` | str | `""` | Footer on a sender's first single-message answer. Empty = "Del-Fi oracle · N pages · !help !topics". |
 | `oracle_type` | str | — | Shown in the GUI only. |
 
 ### 2.2 Model & Ollama

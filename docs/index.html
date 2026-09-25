@@ -234,7 +234,7 @@
 
 <!-- Status bar -->
 <div class="statusbar">
-  <span>DEL-FI NET v0.2</span>
+  <span>DEL-FI NET v0.3</span>
   <span id="clock"></span>
 </div>
 
@@ -295,8 +295,8 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
   <pre>
 <span class="white">COMPUTE (pick one)</span>                         <span class="white">RADIO</span>
 
-  Raspberry Pi 5 8GB .... ~$80            Any Meshtastic or
-  Jetson Orin Nano ...... ~$249           MeshCore LoRa radio.
+  Raspberry Pi 5 8GB .... ~$80            Any Meshtastic
+  Jetson Orin Nano ...... ~$249           LoRa radio.
   Mac Mini M4 ........... ~$499           Heltec V3 is ~$20.
 
   <span class="dim">3B models are the sweet spot.              Antenna placement matters
@@ -416,18 +416,19 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
 <section class="box box-fixed">
   <span class="box-title blue">ARCHITECTURE</span>
   <pre>
-<span class="dim">[LoRa Radio]</span> &lt;--serial/tcp--&gt; <span class="dim">[Mesh Adapter]</span> &lt;--&gt; <span class="dim">[Router]</span> &lt;--&gt; <span class="dim">[Tier Hierarchy]</span>
+<span class="dim">[LoRa Radio]</span> &lt;--serial/tcp--&gt; <span class="dim">[Mesh Adapter]</span> &lt;--&gt; <span class="dim">[Dispatcher]</span> &lt;--&gt; <span class="dim">[Router]</span>
                                      |               |               |
-                              <span class="dim">(meshtastic</span>    <span class="dim">[Formatter]</span>    Tier 0  <span class="white">FactStore</span>   sensor feed, no LLM
-                               <span class="dim">or meshcore)</span>               Tier 1  <span class="white">WikiEngine</span>  BM25 + LLM on compiled wiki
+                              <span class="dim">(meshtastic)</span>   <span class="dim">rate limit,</span>     Tier 0  <span class="white">FactStore</span>   sensor feed, no LLM
+                                             <span class="dim">queue</span>           Tier 1  <span class="white">WikiEngine</span>  wiki search + best source passages
                                                            Tier 2  <span class="white">PeerCache</span>   trusted peer Q&amp;A
                                                            Tier 3  <span class="white">GossipDir</span>   referrals only
 
-<span class="white">main.py</span> ................. entry point, daemon lifecycle, --build-wiki, --lint-wiki
+<span class="white">main.py</span> ................. entry point: daemon, --simulator, --build-wiki, --lint-wiki, --gui
 <span class="white">del_fi/</span>
   <span class="dim">config.py</span> ............. YAML loading, validation, oracle profiles
   <span class="dim">core/</span>
-    <span class="white">knowledge.py</span> ......... WikiEngine: compile knowledge/ → wiki/, BM25 query, lint
+    <span class="white">dispatcher.py</span> ........ main loop: rate limit, question queue, worker thread
+    <span class="white">knowledge.py</span> ......... WikiEngine: compile knowledge/ → wiki/, passage retrieval, lint
       <span class="dim">knowledge/</span> .......... raw source docs (human-owned, gitignored)
       <span class="dim">wiki/</span> ............... LLM-compiled pages, rebuilt via --build-wiki
     <span class="white">router.py</span> ........... command dispatch, tier routing, !more buffer
@@ -439,8 +440,8 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
     <span class="white">board.py</span> ............ community message board, !post / !board
   <span class="dim">mesh/</span>
     <span class="dim">base.py</span> ............. abstract MeshAdapter interface
-    <span class="dim">meshtastic_adapter.py</span>  Meshtastic radios (serial/TCP/BLE)
-    <span class="dim">meshcore_adapter.py</span>    MeshCore radios (stub -- ready to implement)
+    <span class="dim">meshtastic_adapter.py</span>  Meshtastic radios (serial/TCP/BLE), auto-reconnect
+    <span class="dim">meshcore_adapter.py</span>    MeshCore radios (stub -- not functional yet)
     <span class="dim">simulator.py</span> ........ stdin/stdout for development
 </pre>
 </section>

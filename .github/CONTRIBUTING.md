@@ -26,7 +26,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 # Run tests (no hardware or Ollama required)
-python -m unittest discover tests/
+python -m unittest discover -s tests -t .
 
 # Simulator mode (no radio hardware required)
 python main.py --simulator
@@ -58,20 +58,25 @@ and the testing contract.
 
 ## Adding a new mesh adapter
 
-1. Create `mesh/<protocol>_adapter.py`
-2. Subclass `MeshAdapter` from `mesh/base.py`
+1. Create `del_fi/mesh/<protocol>_adapter.py`
+2. Subclass `MeshAdapter` from `del_fi/mesh/base.py`
 3. Implement: `connect()`, `send_dm(dest, text)`, `close()`
-4. Optionally implement `reconnect_loop()` for auto-recovery
-5. Register the adapter name in `config.py` → `MESH_ADAPTERS` dict
-6. Add tests in `tests/test_mesh.py` covering: connect, send_dm, rate limiting, dedup
+4. Implement `reconnect_loop()` so a dropped link recovers on its own, and
+   `send_broadcast()` if the protocol can broadcast (gossip)
+5. Register it in `del_fi/mesh/__init__.py` → `ADAPTERS` and in
+   `SUPPORTED_PROTOCOLS` in `del_fi/config.py`
+6. Add tests in `tests/test_mesh.py` covering: connect/reconnect, send_dm,
+   dedup, and which broadcasts are forwarded. Rate limiting is the
+   Dispatcher's job, not the adapter's. See `.claude/spec-mesh.md`.
 
 ---
 
 ## Adding a new command
 
-1. Add entry to `COMMAND_REGISTRY` in `router.py`
+1. Add an entry to `self._commands` in `Router.__init__` (`del_fi/core/router.py`)
 2. Implement `_cmd_<name>(self, sender: str, args: str) -> str`
-3. Handler must return a string — the formatter will enforce the 230-byte limit
+3. Return plain text of any length — long output is split into messages
+   with `!more` automatically
 4. Update `_cmd_help()` text to include the new command
 5. Add tests in `tests/test_router.py`
 
@@ -83,14 +88,16 @@ and the testing contract.
 - Type hints on all public methods
 - Logging via `log = logging.getLogger(__name__)` — no `print()` in library code
 - Max line length: 100 characters
-- Tests use `unittest` (no pytest dependency)
+- Tests use `unittest` (no pytest dependency). Plain `def test_...()`
+  functions are fine: each test module ends with a `load_tests` hook
+  (`tests/_support.py`) that collects them
 - Imports: stdlib → third-party → local, with blank lines between groups
 
 ---
 
 ## Pull request checklist
 
-- [ ] Tests pass: `python -m unittest discover tests/`
+- [ ] Tests pass: `python -m unittest discover -s tests -t .` (CI runs 3.10–3.13)
 - [ ] New behaviour has test coverage
 - [ ] No internet calls added (offline-first constraint)
 - [ ] Formatter is still called before every radio send
@@ -104,7 +111,7 @@ and the testing contract.
 Use the **Bug Report** issue template. Include:
 - Hardware (Raspberry Pi model, PC, etc.)
 - OS and Python version
-- Mesh adapter type (Meshtastic serial/TCP/BLE, MeshCore, simulator)
+- Mesh adapter type (Meshtastic serial/TCP/BLE, simulator)
 - Ollama model being used
 - Full error output and relevant log lines
 

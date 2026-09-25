@@ -399,35 +399,18 @@ LINT RESULT: 2 warnings, 0 errors
 
 ---
 
-## 11. Migration from rag.py
+## 11. Migration from rag.py (complete)
 
-### What changes
+| Concern | v0.1 rag.py | v0.2 knowledge.py | v0.3 knowledge.py |
+|---------|-------------|-------------------|-------------------|
+| Ingestion trigger | File change → re-chunk and embed | File change → `build()` → wiki update | Same, with the serving model; deleted sources pruned |
+| Retrieval unit | 1024-char chunk | Whole wiki page (+ whole source files) | Wiki page finds the source; ranked source passages are read |
+| LLM reads | Raw document fragments | Wiki page + entire raw files, untrimmed | Best passages within `max_context_tokens` |
+| Index | ChromaDB only | `wiki/index.md` (BM25) + ChromaDB | Same |
+| Build model | Same as serving model | `wiki_builder_model` | Same; the watcher never uses it |
 
-| Concern | v0.1 rag.py | v0.2 knowledge.py |
-|---------|-------------|-------------------|
-| Ingestion trigger | File change → immediate re-chunk and embed | File change → `build()` → wiki update → re-embed whole page |
-| Retrieval unit | 1024-char chunk | Whole wiki page |
-| LLM reads | Raw document fragments | Synthesised wiki page |
-| Index | ChromaDB only | `wiki/index.md` (BM25) + ChromaDB (vector) |
-| Contradiction handling | None (duplicate chunks) | superseded annotation |
-| Staleness | None | `last_ingested` frontmatter + lint check |
-| Build model | Same as serving model | `wiki_builder_model` (can be larger) |
-
-### What stays the same
-
-- ChromaDB with SQLite backend at `vectorstore/`.
-- Embedding model: `nomic-embed-text` via Ollama.
-- Ollama generation API endpoint.
-- `similarity_threshold`, `rag_top_k` config keys (semantics unchanged; now apply to wiki pages).
-- The `query()` interface that `Router` calls.
-
-### Migration path (Phase 2)
-
-1. `WikiEngine` is implemented alongside `RAGEngine` initially.
-2. `Router` is updated to call `wiki_engine.query()` instead of `rag_engine.retrieve()`.
-3. Old ChromaDB collection (`del_fi_knowledge`) is left on disk but not written to.
-4. After a `--build-wiki` run, the new collection (`del_fi_wiki`) is populated.
-5. `rag.py` is removed in a follow-up commit once tests pass.
+The v0.1 `RAGEngine` (`rag.py`) was removed in v0.3; its ChromaDB collection
+(`del_fi_knowledge`) may still be on disk and can be deleted.
 
 ---
 

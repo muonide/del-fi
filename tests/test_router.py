@@ -676,6 +676,11 @@ def test_footer_not_added_to_multi_chunk_answer():
     assert not any("Del-Fi oracle" in m for m in msgs)
 
 
+def test_custom_welcome_footer():
+    router = _router_with(_ScriptedWiki("Yes."), welcome_footer="RIDGELINE — ask about trails.")
+    assert router.route("!new", "is it open").endswith("---\nRIDGELINE — ask about trails.")
+
+
 def test_footer_added_once_to_short_answer():
     router = _router_with(_ScriptedWiki("Yes.", "No."))
     assert "Del-Fi oracle" in router.route("!new", "is it open")
