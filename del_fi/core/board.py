@@ -89,6 +89,7 @@ class Board:
 
         self._posts: list[dict] = []
         self._lock = threading.Lock()
+        self._disk_mtime: float | None = None
 
         if self._persist:
             self._load_disk()
@@ -118,6 +119,7 @@ class Board:
             return "Post rejected by content filter."
 
         with self._lock:
+            self._sync_from_disk()
             self._expire()
             self._posts.append({"sender": sender_id, "text": text, "ts": time.time()})
             if len(self._posts) > self.max_posts:
@@ -134,6 +136,7 @@ class Board:
         """Read the board. Empty query = recent posts. Non-empty = search."""
         query = query.strip()
         with self._lock:
+            self._sync_from_disk()
             self._expire()
             if not self._posts:
                 return "The board is empty. Post with: !post <message>"
@@ -144,6 +147,7 @@ class Board:
     def clear(self, sender_id: str) -> str:
         """Remove all posts from a sender."""
         with self._lock:
+            self._sync_from_disk()
             before = len(self._posts)
             self._posts = [p for p in self._posts if p["sender"] != sender_id]
             removed = before - len(self._posts)
@@ -158,6 +162,7 @@ class Board:
     @property
     def post_count(self) -> int:
         with self._lock:
+            self._sync_from_disk()
             self._expire()
             return len(self._posts)
 
@@ -171,6 +176,7 @@ class Board:
         Returns "" when nothing relevant is on the board.
         """
         with self._lock:
+            self._sync_from_disk()
             self._expire()
             posts = list(self._posts)
 
@@ -245,9 +251,22 @@ class Board:
         now = time.time()
         self._posts = [p for p in self._posts if now - p["ts"] < self.post_ttl]
 
+    def _sync_from_disk(self):
+        """Reload if another process (the GUI) changed board.json since we
+        last read or wrote it. Call with self._lock held."""
+        if not self._persist:
+            return
+        try:
+            mtime = os.path.getmtime(self._board_file)
+        except OSError:
+            return
+        if mtime != self._disk_mtime:
+            self._load_disk()
+
     def _load_disk(self):
         try:
             if os.path.exists(self._board_file):
+                self._disk_mtime = os.path.getmtime(self._board_file)
                 with open(self._board_file) as f:
                     data = json.load(f)
                 self._posts = [
@@ -262,4 +281,5 @@ class Board:
     def _save_disk(self):
         with self._lock:
             data = {"posts": list(self._posts)}
-        write_atomic(self._board_file, json.dumps(data))
+            if write_atomic(self._board_file, json.dumps(data)):
+                self._disk_mtime = os.path.getmtime(self._board_file)

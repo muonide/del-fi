@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import logging
+import logging.handlers
 import os
 import queue
 import signal
@@ -42,16 +43,33 @@ class _DelFiFormatter(logging.Formatter):
         return text
 
 
-def setup_logging(level: str, simulator: bool = False):
+def setup_logging(level: str, log_file: str = "", simulator: bool = False):
+    """Log to stderr (journald under systemd) and/or a rotating file.
+
+    In simulator mode stdout is the chat, so logs go to the file only.
+    """
     numeric = getattr(logging, level.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(numeric)
-    if simulator:
-        handler = logging.FileHandler("del_fi.log", mode="a", encoding="utf-8")
-    else:
-        handler = logging.StreamHandler()
-    handler.setFormatter(_DelFiFormatter())
-    root.addHandler(handler)
+    handlers: list[logging.Handler] = []
+    if not simulator:
+        handlers.append(logging.StreamHandler())
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        # Rotated so a busy node cannot fill the SD card.
+        handlers.append(logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        ))
+    for handler in handlers:
+        handler.setFormatter(_DelFiFormatter())
+        root.addHandler(handler)
+
+
+def default_log_file(cfg: dict, simulator: bool) -> str:
+    """log_file from config; in simulator mode, del_fi.log next to the config."""
+    if cfg.get("log_file"):
+        return cfg["log_file"]
+    return os.path.join(cfg["_config_dir"], "del_fi.log") if simulator else ""
 
 
 # ─────────────────────────── Banner ───────────────────────────────────────
@@ -297,7 +315,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg["log_level"], simulator=args.simulator)
+    setup_logging(cfg["log_level"], default_log_file(cfg, args.simulator),
+                  simulator=args.simulator)
     log.info(f"del-fi v{VERSION} starting")
 
     if args.build_wiki:
@@ -308,7 +327,7 @@ def main():
 
     if args.gui:
         from del_fi.gui import launch
-        launch(cfg, args.config or "config.yaml",
+        launch(cfg, cfg["_config_path"],
                port=args.gui_port, open_browser=not args.no_browser)
         return
 

@@ -501,6 +501,20 @@ def test_load_skips_malformed_entries():
     assert board.post_count == 1
 
 
+def test_two_processes_share_the_board_file():
+    """The daemon and the GUI each hold a Board on the same board.json."""
+    cfg = _make_cfg(board_persist=True)
+    daemon, gui = Board(cfg), Board(cfg)
+    daemon.post("!alice", "Water main break on Oak St")
+    time.sleep(0.01)  # distinct mtimes
+    gui.post("!gui00000", "Operator: boil water notice lifted")
+    time.sleep(0.01)
+    daemon.post("!bob", "Swap meet Saturday")
+    texts = daemon.read()
+    assert "Water main" in texts and "boil water" in texts and "Swap meet" in texts
+    assert gui.post_count == 3
+
+
 # ---------------------------------------------------------------------------
 # unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------

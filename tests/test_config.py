@@ -161,6 +161,53 @@ class TestWikiConfig(unittest.TestCase):
         self.assertEqual(cfg["wiki_builder_model"], "qwen2.5:7b")
 
 
+class TestValidationV03(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-cfgtest-")
+
+    def _read(self, content):
+        from del_fi.config import read_config
+        return read_config(_write_config(self.tmpdir, content))
+
+    def _error(self, content) -> str:
+        from del_fi.config import ConfigError
+        with self.assertRaises(ConfigError) as ctx:
+            self._read(content)
+        return str(ctx.exception)
+
+    def test_read_config_raises_instead_of_exiting(self):
+        self.assertIn("node_name", self._error("model: m\n"))
+
+    def test_non_mapping_yaml(self):
+        self.assertIn("mapping", self._error("- just\n- a list\n"))
+
+    def test_model_must_be_a_name(self):
+        self.assertIn("model", self._error('node_name: "T"\nmodel: null\n'))
+
+    def test_radio_connection_checked(self):
+        self.assertIn("radio_connection", self._error('node_name: "T"\nradio_connection: wifi\n'))
+
+    def test_log_level_checked(self):
+        self.assertIn("log_level", self._error('node_name: "T"\nlog_level: loud\n'))
+
+    def test_integer_settings_checked(self):
+        self.assertIn("auto_send_chunks", self._error('node_name: "T"\nauto_send_chunks: 0\n'))
+        self.assertIn("num_ctx", self._error('node_name: "T"\nnum_ctx: 100\n'))
+
+    def test_unknown_keys_warned(self):
+        with self.assertLogs("del_fi.config", level="WARNING") as logs:
+            self._read('node_name: "T"\nrate_limit_second: 5\n')
+        self.assertIn("rate_limit_second", logs.output[0])
+
+    def test_config_path_and_log_file_resolved(self):
+        cfg = self._read('node_name: "T"\nlog_file: logs/delfi.log\n')
+        self.assertEqual(cfg["_config_path"], os.path.join(os.path.realpath(self.tmpdir), "config.yaml"))
+        self.assertEqual(cfg["log_file"], os.path.join(os.path.realpath(self.tmpdir), "logs", "delfi.log"))
+
+    def test_node_name_coerced_to_string(self):
+        self.assertEqual(self._read("node_name: 42\n")["node_name"], "42")
+
+
 class TestMeshKnowledge(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="delfi-cfgtest-")

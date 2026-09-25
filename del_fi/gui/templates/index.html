@@ -301,7 +301,6 @@ const CFG_SCHEMA = [
     { key:'node_name',    label:'Node Name',        type:'text',   required:true, placeholder:'RIDGELINE' },
     { key:'oracle_type',  label:'Oracle Type',      type:'select', options:['','observatory','community-hub','emergency','event','lore'] },
     { key:'personality',  label:'Personality Prompt', type:'textarea', rows:4, full:true },
-    { key:'description',  label:'Description',      type:'text',   full:true },
     { key:'fallback_message', label:'Fallback Message', type:'text', full:true, placeholder:"I don't have docs on that. Try !topics to see what I know." },
   ]},
   { id:'model', label:'Model & Ollama', fields:[
@@ -319,14 +318,18 @@ const CFG_SCHEMA = [
     { key:'radio_connection',   label:'Connection',        type:'select', options:['serial','tcp','ble'] },
     { key:'radio_port',         label:'Port / Host:Port',  type:'text',   placeholder:'/dev/ttyUSB0' },
     { key:'rate_limit_seconds', label:'Rate Limit (s)',    type:'number', def:30, min:0 },
-    { key:'channels',           label:'Channels (one per line)', type:'list', full:true },
+    { key:'rate_limit_notice',  label:'Tell Rate-Limited Senders', type:'bool' },
+    { key:'query_queue_size',   label:'Max Queued Questions', type:'number', def:10, min:1 },
+    { key:'want_ack',           label:'Ask Radio to ACK DMs', type:'bool' },
   ]},
   { id:'wiki', label:'Wiki & Knowledge', fields:[
     { key:'wiki_folder',               label:'Wiki Folder',            type:'text',   def:'./wiki' },
     { key:'knowledge_folder',          label:'Knowledge Folder',       type:'text',   def:'./knowledge' },
     { key:'wiki_rebuild_on_start',     label:'Rebuild Wiki on Startup',type:'bool' },
     { key:'wiki_stale_after_days',     label:'Stale After (days)',     type:'number', def:30, min:1 },
+    { key:'wiki_watch_enabled',        label:'Watch knowledge/ for Changes', type:'bool' },
     { key:'wiki_watch_interval_seconds',label:'Watch Interval (s)',    type:'number', def:60 },
+    { key:'wiki_patch_model',          label:'Watcher Rebuild Model', type:'text', placeholder:'serving model' },
     { key:'time_sensitive_files',      label:'Time-Sensitive Files (one per line)', type:'list', full:true },
   ]},
   { id:'retrieval', label:'Retrieval', fields:[
@@ -362,14 +365,39 @@ const CFG_SCHEMA = [
   ]},
   { id:'logging', label:'Logging', fields:[
     { key:'log_level', label:'Log Level', type:'select', options:['debug','info','warning','error'] },
+    { key:'log_file',  label:'Log File',  type:'text', placeholder:'none (simulator: del_fi.log)' },
   ]},
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 async function api(path, opts) {
   const res = await fetch(path, opts);
-  if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* non-JSON error page */ }
+  if (!res.ok && res.status !== 404 && !(body && body.error)) throw new Error(`HTTP ${res.status}`);
+  return body || {};
+}
+
+// State-changing calls must be JSON: the server rejects anything else,
+// which stops other websites from posting to this local GUI.
+function post(path, data) {
+  return api(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data || {}),
+  });
+}
+
+// Start a wiki build and poll until it finishes; returns the final status.
+async function runWikiBuild(outputId) {
+  const start = await post('/api/wiki/build');
+  if (!start.ok) return {ok: false, output: start.error || 'could not start build'};
+  for (;;) {
+    await new Promise(r => setTimeout(r, 2000));
+    const st = await api('/api/wiki/build/status');
+    showOutput(outputId, (st.output || 'Building…') + (st.running ? `\n… ${st.elapsed_s}s` : ''), true);
+    if (!st.running) return {ok: st.returncode === 0, output: st.output || ''};
+  }
 }
 
 function fmtUptime(s) {
@@ -438,7 +466,7 @@ async function loadDashboard() {
     ho.className = s.ollama_ok ? 'ok' : 'err';
 
     document.getElementById('dc-name').textContent = s.node_name;
-    document.getElementById('dc-type').innerHTML = [
+    document.getElementById('dc-type').textContent = [
       s.model, s.oracle_type || 'oracle'
     ].filter(Boolean).join(' · ');
 
@@ -466,8 +494,8 @@ async function dashBuildWiki(btn) {
   setBtn(btn, true);
   showOutput('dash-output', 'Building wiki…', true);
   try {
-    const r = await api('/api/wiki/build', {method:'POST'});
-    showOutput('dash-output', (r.stdout || '') + (r.stderr || ''), r.ok);
+    const r = await runWikiBuild('dash-output');
+    showOutput('dash-output', r.output, r.ok);
     toast(r.ok ? 'Wiki built.' : 'Build failed.', r.ok ? 'ok' : 'err');
     loadDashboard();
   } catch(e) {
@@ -479,8 +507,8 @@ async function dashBuildWiki(btn) {
 async function dashLintWiki(btn) {
   setBtn(btn, true);
   try {
-    const r = await api('/api/wiki/lint', {method:'POST'});
-    showOutput('dash-output', (r.stdout || '') + (r.stderr || ''), r.ok);
+    const r = await post('/api/wiki/lint');
+    showOutput('dash-output', (r.stdout || '') + (r.stderr || '') + (r.error || ''), r.ok);
     toast(r.ok ? 'Wiki clean.' : 'Issues found.', r.ok ? 'ok' : 'warn');
   } catch(e) {
     showOutput('dash-output', e.message, false);
@@ -646,17 +674,14 @@ async function saveConfig(btn) {
   if (!cfg.model) { toast('model is required', 'err'); return; }
   setBtn(btn, true);
   try {
-    const r = await api('/api/config', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({config: cfg}),
-    });
+    const managed = [...document.querySelectorAll('#config-form [data-key]')].map(el => el.dataset.key);
+    const r = await post('/api/config', {config: cfg, managed_keys: managed});
     if (r.ok) {
       gConfigDirty = false;
       const st = document.getElementById('cfg-status');
       st.textContent = '✓ saved';
       st.className = 'status-msg ok';
-      toast('Config saved.', 'ok');
+      toast(r.backup ? 'Config saved (previous version: config.yaml.bak).' : 'Config saved.', 'ok');
       loadDashboard();
     } else {
       toast('Save failed: ' + r.error, 'err');
@@ -693,7 +718,7 @@ function renderWikiPages(pages) {
     const item = document.createElement('div');
     item.className = 'wiki-page-item';
     item.innerHTML = `<div class="pg-title">${esc(p.title)}</div>
-      <div class="pg-meta">${p.last_ingested || ''}${p.size ? '  ' + fmtBytes(p.size) : ''}</div>`;
+      <div class="pg-meta">${esc(p.last_ingested || '')}${p.size ? '  ' + fmtBytes(p.size) : ''}</div>`;
     item.onclick = () => {
       document.querySelectorAll('.wiki-page-item').forEach(i => i.classList.remove('active'));
       item.classList.add('active');
@@ -739,8 +764,8 @@ async function buildWiki(btn) {
   st.className = 'status-msg';
   setBtn(btn, true);
   try {
-    const r = await api('/api/wiki/build', {method:'POST'});
-    showOutput('wiki-build-output', (r.stdout||'') + (r.stderr||''), r.ok);
+    const r = await runWikiBuild('wiki-build-output');
+    showOutput('wiki-build-output', r.output, r.ok);
     st.textContent = r.ok ? '✓ built' : '✗ failed';
     st.className = 'status-msg ' + (r.ok ? 'ok' : 'err');
     toast(r.ok ? 'Wiki built.' : 'Build failed.', r.ok ? 'ok' : 'err');
@@ -758,8 +783,8 @@ async function lintWiki(btn) {
   st.textContent = 'linting…';
   setBtn(btn, true);
   try {
-    const r = await api('/api/wiki/lint', {method:'POST'});
-    showOutput('wiki-build-output', (r.stdout||'') + (r.stderr||''), r.ok);
+    const r = await post('/api/wiki/lint');
+    showOutput('wiki-build-output', (r.stdout||'') + (r.stderr||'') + (r.error||''), r.ok);
     st.textContent = r.ok ? '✓ clean' : '⚠ issues';
     st.className = 'status-msg ' + (r.ok ? 'ok' : 'warn');
     toast(r.ok ? 'Wiki clean.' : 'Issues found — see output.', r.ok ? 'ok' : 'warn');
@@ -812,11 +837,7 @@ async function sendSim() {
   st.className = 'status-msg';
 
   try {
-    const r = await api('/api/simulate', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({sender, text}),
-    });
+    const r = await post('/api/simulate', {sender, text});
     st.textContent = '';
     if (r.ok) {
       (r.responses || []).forEach(resp => appendSimMsg(resp, 'received'));
@@ -866,14 +887,10 @@ async function boardPost(btn) {
   if (!text) { toast('Enter post text', 'warn'); return; }
   setBtn(btn, true);
   try {
-    const r = await api('/api/simulate', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({sender, text: '!post ' + text}),
-    });
+    const r = await post('/api/board/post', {sender, text});
     if (r.ok) {
       document.getElementById('bp-text').value = '';
-      toast((r.responses && r.responses[0]) || 'Posted.', 'ok');
+      toast(r.result || 'Posted.', r.result && r.result.startsWith('Posted') ? 'ok' : 'warn');
       loadBoard();
     } else {
       toast('Post failed: ' + (r.error || ''), 'err');
@@ -921,7 +938,8 @@ function toggleAutoLogs() {
 
 // ── Utility ────────────────────────────────────────────────────────────────
 function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
