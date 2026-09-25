@@ -13,7 +13,7 @@ A wilderness observatory oracle for Ridgeline Station, a remote field research s
 | Hardware | Raspberry Pi 5 + Meshtastic LoRa module |
 | Location | Ridgeline Station, 9,240 ft, Routt National Forest, CO |
 | Power | 200W solar + 400Ah battery + wind turbine supplement |
-| Serving model | `gemma4:4b` |
+| Serving model | `gemma4:e4b` |
 | Builder model | `gemma4:12b` |
 | Neighbors | VALLEY-ORACLE (9 mi SE, 6,800 ft), SUMMIT-POST (11,100 ft, sensor-only) |
 
@@ -28,7 +28,7 @@ A wilderness observatory oracle for Ridgeline Station, a remote field research s
 node_name: "RIDGELINE"
 oracle_type: "observatory"
 
-model: "gemma4:4b"
+model: "gemma4:e4b"
 wiki_builder_model: "gemma4:12b"
 
 knowledge_folder: ./knowledge

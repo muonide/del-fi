@@ -12,7 +12,7 @@
 node_name: "MAPLEWOOD-ORACLE"
 
 # --- Model ---
-model: "gemma4:4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
+model: "gemma4:e4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 # wiki_builder_model: "gemma4:12b"   # bigger model for --build-wiki (falls back to model)
 # ollama_host: "http://localhost:11434"
 # ollama_timeout: 120                # seconds per answer
@@ -26,7 +26,7 @@ model: "gemma4:4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 #
 # --- Example: Community Hub (default) ---
 # node_name: "MAPLEWOOD-ORACLE"
-# model: "gemma4:4b"
+# model: "gemma4:e4b"
 # wiki_builder_model: "gemma4:12b"
 # oracle_type: community-hub
 # personality: >
@@ -36,7 +36,7 @@ model: "gemma4:4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 #
 # --- Example: Wilderness Observatory ---
 # node_name: "RIDGELINE"
-# model: "gemma4:4b"
+# model: "gemma4:e4b"
 # wiki_builder_model: "gemma4:12b"
 # oracle_type: observatory
 # personality: >
@@ -47,7 +47,7 @@ model: "gemma4:4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 #
 # --- Example: RPG Game Master ---
 # node_name: "DUNGEON-ORACLE"
-# model: "gemma4:4b"
+# model: "gemma4:e4b"
 # oracle_type: lore
 # personality: >
 #   You are DUNGEON-ORACLE, the Game Master for The Shattered Realm.

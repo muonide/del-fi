@@ -99,6 +99,11 @@ review of v0.2 is fixed with a regression test.
 
 - **Start command:** `python main.py` (the README said `delfi.py`, which
   doesn't exist). Update systemd `ExecStart` lines accordingly.
+- **Default model:** `gemma4:e4b`. v0.2's default and example configs said
+  `gemma4:4b`, which isn't an Ollama tag (Gemma 4 ships as `gemma4:e2b`,
+  `e4b`, `12b`, `26b` and `31b`). If your `config.yaml` names `gemma4:4b` or
+  `gemma4:2b`, change it to `gemma4:e4b` or `gemma4:e2b`; the model profiles
+  now match those tags.
 - **Peering config:** move `trusted_peers`, `peer_cache_ttl`,
   `max_cache_entries` and `gossip_announce_interval` into the
   `mesh_knowledge` block (see `config.example.yaml`). The old keys still work

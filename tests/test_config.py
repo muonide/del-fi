@@ -288,6 +288,31 @@ class TestParseDuration(unittest.TestCase):
         self.assertIsNone(parse_duration(-5))
 
 
+class TestOracleProfiles(unittest.TestCase):
+    """The default used to be gemma4:4b, which is not an Ollama tag
+    (Gemma 4 ships as gemma4:e2b, e4b, 12b, 26b, 31b)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-cfgtest-")
+
+    def test_default_model_is_a_real_tag_with_a_profile(self):
+        from del_fi.config import DEFAULTS, ORACLE_PROFILES, _match_profile
+        self.assertEqual(DEFAULTS["model"], "gemma4:e4b")
+        self.assertIs(_match_profile(DEFAULTS["model"]), ORACLE_PROFILES["gemma4:e4b"])
+
+    def test_gemma4_e2b_gets_the_small_model_profile(self):
+        path = _write_config(self.tmpdir, 'node_name: "T"\nmodel: "gemma4:e2b"\n')
+        cfg = load_config(path)
+        self.assertEqual(cfg["max_context_tokens"], 512)
+        self.assertTrue(cfg["small_model_prompt"])
+
+    def test_tag_variants_match_their_profile(self):
+        from del_fi.config import ORACLE_PROFILES, _match_profile
+        self.assertIs(_match_profile("gemma4:e4b-it-qat"), ORACLE_PROFILES["gemma4:e4b"])
+        self.assertIs(_match_profile("GEMMA4:E2B"), ORACLE_PROFILES["gemma4:e2b"])
+        self.assertIsNone(_match_profile("gemma4:26b"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

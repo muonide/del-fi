@@ -336,7 +336,7 @@ python main.py
 For `--build-wiki`, set `wiki_builder_model` in config to a larger model even if the serving model is smaller:
 
 ```yaml
-model: "gemma4:4b"           # used for query answering
+model: "gemma4:e4b"           # used for query answering
 wiki_builder_model: "gemma4:12b"  # used only for --build-wiki
 ```
 
