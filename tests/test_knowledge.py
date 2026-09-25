@@ -10,6 +10,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 from datetime import date, timedelta
@@ -86,12 +87,15 @@ class _FakeOllamaClient:
         r.response = self.generate_response
         return r
 
-    def embeddings(self, model: str, prompt: str):
-        self.embed_calls.append(prompt)
-        # Return a simple vector (16-dimensional fake embedding)
-        h = hashlib.md5(prompt.encode()).digest()
-        vec = [(b / 127.5) - 1.0 for b in h]
-        return {"embedding": vec}
+    def embed(self, model: str, input: str, **kwargs):
+        """Same shape as ollama.Client.embed: .embeddings is a list of vectors."""
+        self.embed_calls.append(input)
+        return types.SimpleNamespace(embeddings=[self._vector(input)])
+
+    def _vector(self, text: str):
+        # A simple 16-dimensional fake embedding
+        h = hashlib.md5(text.encode()).digest()
+        return [(b / 127.5) - 1.0 for b in h]
 
 
 def _make_engine(tmpdir: str, ollama_client=None, **cfg_overrides):
@@ -977,6 +981,57 @@ class TestPruneAndWatch(unittest.TestCase):
         os.remove(os.path.join(kdir, "beta.md"))  # not pruned yet
         issues = engine.lint()
         self.assertTrue(any("missing source: beta.md" in i for i in issues), issues)
+
+
+class _BagOfWordsClient(_FakeOllamaClient):
+    """Embeds text as word counts over a tiny vocabulary, so similarity
+    follows shared words and semantic search results are predictable."""
+
+    VOCAB = ("trail", "map", "summit", "fire", "water", "stove")
+
+    def _vector(self, text: str) -> list[float]:
+        words = text.lower().replace(".", " ").split()
+        return [words.count(w) + 0.01 for w in self.VOCAB]
+
+
+class TestEmbeddings(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-embed-")
+
+    def test_embed_text_uses_the_embed_api(self):
+        client = _FakeOllamaClient()
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        vec = engine._embed_text("where is the trailhead")
+        self.assertEqual(len(vec), 16)
+        self.assertEqual(client.embed_calls, ["where is the trailhead"])
+
+    def test_embed_failure_returns_none(self):
+        client = _FakeOllamaClient()
+        client.embed = unittest.mock.Mock(side_effect=ConnectionError("refused"))
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        self.assertIsNone(engine._embed_text("anything"))
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("chromadb"), "chromadb not installed"
+    )
+    def test_semantic_search_with_real_chromadb(self):
+        """Embed, search and delete through the real ChromaDB client."""
+        engine = _make_engine(self.tmpdir, ollama_client=_BagOfWordsClient())
+        engine._init_vectorstore()
+        self.assertTrue(engine._rag_available)
+        wdir = engine.cfg["wiki_folder"]
+        _write_file(os.path.join(wdir, "trail-guide.md"),
+                    _make_wiki_page("Trail Guide", ["trail"], "The trail map shows the summit trail."))
+        _write_file(os.path.join(wdir, "fire-safety.md"),
+                    _make_wiki_page("Fire Safety", ["fire"], "Keep water near the stove and the fire."))
+
+        engine._embed_wiki_pages()
+        self.assertEqual(engine._collection.count(), 2)
+        self.assertEqual(engine._vector_search("which trail goes to the summit"), ["trail-guide"])
+
+        engine._delete_embedding("trail-guide")
+        self.assertEqual(engine._collection.count(), 1)
+        self.assertEqual(engine._vector_search("which trail goes to the summit"), [])
 
 
 if __name__ == "__main__":

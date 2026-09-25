@@ -12,7 +12,7 @@ A Game Master oracle for The Shattered Realm, a dark fantasy tabletop RPG settin
 | Oracle type | `lore` |
 | Hardware | Any Del-Fi hardware (Raspberry Pi 4+, laptop, or server) |
 | Location | Game table, convention booth, or LARP field site |
-| Serving model | `gemma4:4b` |
+| Serving model | `gemma4:e4b` |
 | Builder model | `gemma4:12b` (or run once on a larger machine before the session) |
 
 **Persona:** An enchanted stone tablet at the Delver's Guild outpost at Thornwall Crossroads. The Oracle speaks with dry authority. It answers questions about the realm, its dangers, its factions, and the rules of Delving. It does not improvise lore — it cites what is documented. It ends responses with `// DUNGEON-ORACLE`.
@@ -27,7 +27,7 @@ A Game Master oracle for The Shattered Realm, a dark fantasy tabletop RPG settin
 node_name: "DUNGEON-ORACLE"
 oracle_type: "lore"
 
-model: "gemma4:4b"
+model: "gemma4:e4b"
 wiki_builder_model: "gemma4:12b"
 
 knowledge_folder: ./knowledge

@@ -12,7 +12,7 @@ A community hub oracle for Maplewood, a residential neighborhood in the Pacific 
 | Oracle type | `community-hub` |
 | Hardware | Raspberry Pi 5 + Meshtastic LoRa module |
 | Location | Roof of Maplewood Branch Library |
-| Serving model | `gemma4:4b` |
+| Serving model | `gemma4:e4b` |
 | Builder model | `gemma4:12b` |
 | Neighbors | EASTSIDE-RELAY, GARFIELD-NODE, MILLBROOK-SENSOR |
 
@@ -28,7 +28,7 @@ A community hub oracle for Maplewood, a residential neighborhood in the Pacific 
 node_name: "MAPLEWOOD-ORACLE"
 oracle_type: "community-hub"
 
-model: "gemma4:4b"
+model: "gemma4:e4b"
 wiki_builder_model: "gemma4:12b"
 
 knowledge_folder: ./knowledge
@@ -110,7 +110,7 @@ python main.py --lint-wiki --config config.yaml
 ```bash
 # Install Ollama and pull models
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull gemma4:4b          # serving model (always running)
+ollama pull gemma4:e4b         # serving model (always running)
 ollama pull gemma4:12b         # builder model (used only for --build-wiki)
 ollama pull nomic-embed-text   # embeddings
 

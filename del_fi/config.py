@@ -17,7 +17,7 @@ import yaml
 log = logging.getLogger("del_fi.config")
 
 DEFAULTS: dict = {
-    "model": "gemma4:4b",
+    "model": "gemma4:e4b",
     "personality": "You are a helpful and concise community assistant.",
     "fallback_message": "",              # empty: suggest known topics instead
     "welcome_footer": "",                # first-contact footer; empty = built-in
@@ -89,14 +89,14 @@ DEFAULTS: dict = {
 # when the configured model name contains the profile key (substring, case-insensitive).
 # Keys NOT explicitly set in config.yaml take the profile value.
 ORACLE_PROFILES: dict[str, dict] = {
-    "gemma4:2b": {
+    "gemma4:e2b": {
         "similarity_threshold": 0.35,
         "rag_top_k": 2,
         "max_context_tokens": 512,
         "small_model_prompt": True,
         "reorder_context": True,
     },
-    "gemma4:4b": {
+    "gemma4:e4b": {
         "similarity_threshold": 0.28,
         "rag_top_k": 4,
     },

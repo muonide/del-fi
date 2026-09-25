@@ -75,7 +75,7 @@ Before serving, `--build-wiki` compiles your documents into a small **wiki**: on
 curl -fsSL https://ollama.com/install.sh | sh
 
 # 2. Pull models
-ollama pull gemma4:4b              # serving model (pick your size)
+ollama pull gemma4:e4b             # serving model (pick your size)
 ollama pull nomic-embed-text       # embeddings (optional semantic search)
 
 # Raspberry Pi recommendation: a 1B model runs well on Pi hardware.
@@ -101,7 +101,7 @@ python main.py --build-wiki
 python main.py
 ```
 
-The config file has one required field (`node_name`). Everything else has a sensible default (`model` defaults to `gemma4:4b`). A bad config prints a human-readable error, not a traceback. Del-Fi looks for `config.yaml` next to `main.py` first, then `~/del-fi/config.yaml`; pass `--config PATH` to be explicit.
+The config file has one required field (`node_name`). Everything else has a sensible default (`model` defaults to `gemma4:e4b`). A bad config prints a human-readable error, not a traceback. Del-Fi looks for `config.yaml` next to `main.py` first, then `~/del-fi/config.yaml`; pass `--config PATH` to be explicit.
 
 > **Raspberry Pi / Debian note:** Modern Raspberry Pi OS (Bookworm+) marks the system Python as externally managed (PEP 668), so `pip install` outside a venv will fail. The virtual environment in step 4 handles this. If you see `error: externally-managed-environment`, make sure you activated the venv (`source venv/bin/activate`) before running pip. You may also need `sudo apt install python3-full` if `python3 -m venv` isn't available.
 
@@ -131,7 +131,7 @@ python main.py --build-wiki
 
 While the daemon runs, it also watches the folder: new or edited files are compiled within a minute using the serving model (or `wiki_patch_model`), and pages for deleted files are removed. Run `python main.py --lint-wiki` to check the wiki's health.
 
-File names become your topic list: `wilderness-first-aid.md` shows up as "Wilderness First Aid" in `!topics`. See [examples/GUIDE.md](examples/GUIDE.md) for how to write documents that answer well, and [examples/](examples/) for complete starter deployments.
+File names become your topic list: `wilderness-first-aid.md` shows up as "Wilderness First Aid" in `!topics`. See [examples/GUIDE.md](examples/GUIDE.md) for how to write documents that answer well, and [examples/](examples/) for complete starter deployments, including [DAWN-CHORUS](examples/DAWN-CHORUS/DAWN-CHORUS.md): a birding oracle that identifies birds by their songs and reports live detections from a BirdNET-Pi listening station.
 
 ---
 
@@ -203,7 +203,7 @@ Commands are answered immediately, even while the node is busy thinking about so
 node_name: "FARM-ORACLE"
 
 # Optional — defaults shown
-model: "gemma4:4b"
+model: "gemma4:e4b"
 personality: "You are a helpful and concise community assistant."
 knowledge_folder: ./knowledge   # relative to this file
 radio_connection: serial        # serial | tcp | ble
@@ -221,7 +221,7 @@ log_level: info
 log_file: ""                    # e.g. delfi.log — rotated at 1 MB
 ```
 
-Small models get tuned defaults automatically (a *profile* matched on the model name): `gemma3:1b`, `llama3.2:1b` and `gemma4:2b` read less context with a shorter prompt.
+Small models get tuned defaults automatically (a *profile* matched on the model name): `gemma3:1b`, `llama3.2:1b` and `gemma4:e2b` read less context with a shorter prompt.
 
 ### Sensor Data (Tier 0)
 
