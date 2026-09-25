@@ -94,6 +94,9 @@ review of v0.2 is fixed with a regression test.
   all test functions are now collected. CI runs on Python 3.10–3.13.
 - The daemon loop moved from `main.py` into a tested `Dispatcher`.
 - README, specs and examples match the code. `rag.py` (v0.1) removed.
+- New example, `examples/DAWN-CHORUS`: a birding oracle for a nature preserve,
+  with a sounds-first knowledge base and live BirdNET-Pi detections as
+  Tier 0 facts (`birdnet_feed.py`).
 
 ### Upgrading from 0.2
 

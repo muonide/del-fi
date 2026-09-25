@@ -131,7 +131,7 @@ python main.py --build-wiki
 
 While the daemon runs, it also watches the folder: new or edited files are compiled within a minute using the serving model (or `wiki_patch_model`), and pages for deleted files are removed. Run `python main.py --lint-wiki` to check the wiki's health.
 
-File names become your topic list: `wilderness-first-aid.md` shows up as "Wilderness First Aid" in `!topics`. See [examples/GUIDE.md](examples/GUIDE.md) for how to write documents that answer well, and [examples/](examples/) for complete starter deployments.
+File names become your topic list: `wilderness-first-aid.md` shows up as "Wilderness First Aid" in `!topics`. See [examples/GUIDE.md](examples/GUIDE.md) for how to write documents that answer well, and [examples/](examples/) for complete starter deployments, including [DAWN-CHORUS](examples/DAWN-CHORUS/DAWN-CHORUS.md): a birding oracle that identifies birds by their songs and reports live detections from a BirdNET-Pi listening station.
 
 ---
 
