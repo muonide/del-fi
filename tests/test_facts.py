@@ -8,6 +8,7 @@ import unittest
 
 from del_fi.core.facts import FactStore, _age, _age_label
 from del_fi.core.router import Router
+from tests._support import function_suite
 
 
 # --- Helpers ---
@@ -527,18 +528,12 @@ def test_router_without_fact_store_still_works():
 
 
 # ---------------------------------------------------------------------------
-# unittest discovery wrapper — makes bare test_ functions discoverable
+# unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------
 
-_Tests = type(
-    "_Tests",
-    (unittest.TestCase,),
-    {
-        n: (lambda f: lambda self: f())(f)
-        for n, f in list(globals().items())
-        if n.startswith("test_") and callable(f)
-    },
-)
+
+def load_tests(loader, standard_tests, pattern):
+    return function_suite(globals(), standard_tests)
 
 if __name__ == "__main__":
     unittest.main()

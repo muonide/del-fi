@@ -37,7 +37,12 @@ log = logging.getLogger("del_fi")
 class _DelFiFormatter(logging.Formatter):
     def format(self, record):
         ts = time.strftime("%H:%M:%S", time.localtime(record.created))
-        return f"[{ts}] {record.getMessage()}"
+        text = f"[{ts}] {record.getMessage()}"
+        if record.exc_info:
+            text += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            text += "\n" + self.formatStack(record.stack_info)
+        return text
 
 
 def setup_logging(level: str, simulator: bool = False):

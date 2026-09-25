@@ -16,6 +16,7 @@ from del_fi.core.formatter import (
     strip_markdown,
     truncate_at_sentence,
 )
+from tests._support import function_suite
 
 
 # --- strip_markdown ---
@@ -237,18 +238,12 @@ def test_format_whitespace_only():
 
 
 # ---------------------------------------------------------------------------
-# unittest discovery wrapper — makes bare test_ functions discoverable
+# unittest discovery — collects every bare test_ function in this module
 # ---------------------------------------------------------------------------
 
-_Tests = type(
-    "_Tests",
-    (unittest.TestCase,),
-    {
-        n: (lambda f: lambda self: f())(f)
-        for n, f in list(globals().items())
-        if n.startswith("test_") and callable(f)
-    },
-)
+
+def load_tests(loader, standard_tests, pattern):
+    return function_suite(globals(), standard_tests)
 
 if __name__ == "__main__":
     unittest.main()
