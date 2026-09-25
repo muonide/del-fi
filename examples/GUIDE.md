@@ -18,7 +18,7 @@ A practical guide to writing, organizing, and deploying the documents that power
 
 ## 1. How the LLM Wiki Works
 
-Del-Fi uses a **three-layer knowledge architecture** based on the LLM Wiki pattern. The key insight: retrieval quality improves dramatically when an LLM compiles raw source documents into a structured wiki *once*, at ingest time, rather than feeding raw fragments to the serving model at query time.
+Del-Fi uses a **three-layer knowledge architecture** based on the LLM Wiki pattern: an LLM compiles your source documents into a small structured wiki *once*, at build time. At question time the wiki is used to find the right documents, and the best-matching sections of those documents are what the serving model reads.
 
 ```
 knowledge/          ← You write and maintain these (source of truth)
@@ -36,18 +36,18 @@ wiki/               ← LLM-compiled, structured pages (do not edit by hand)
     index.md
     log.md
          │
-         │  query time (BM25 + vector search)
+         │  query time: search the wiki to pick documents
          ▼
-context assembled → LLM generates answer → response over radio
+best-matching sections of those knowledge/ files → LLM answers → radio
 ```
 
 ### What this means for you
 
 **You own `knowledge/`.** Write clear, factual, well-organized source documents. The builder LLM reads them and compiles structured wiki pages with extracted facts, cross-links, and dense summaries. Think of your source documents as briefing notes for a diligent editor.
 
-**You never touch `wiki/`.** It is generated automatically. If you need to change something, edit the source document in `knowledge/` and run `--build-wiki` again. The wiki compounds — each new source updates existing pages rather than replacing them wholesale.
+**You never touch `wiki/`.** It is generated automatically. If you need to change something, edit the source document in `knowledge/`: while the daemon runs, the wiki watcher recompiles that page within a minute, or you can run `--build-wiki` yourself. Each source file compiles to its own page.
 
-**The wiki is the retrieval unit.** At query time, Del-Fi searches the compiled wiki (not your raw source files). Because the LLM has already synthesised and structured the content, the serving model gets clean, relevant context instead of raw document fragments.
+**The wiki finds; your documents answer.** At question time, Del-Fi searches the compiled wiki to find the relevant documents, then sends the serving model the best-matching sections of those source files, within a context budget (`max_context_tokens`), not whole files. How you write and section your source documents directly shapes the answers.
 
 ### The build pipeline
 
@@ -63,7 +63,7 @@ python main.py --lint-wiki
 
 ### The 230-byte output constraint
 
-LoRa radio limits each message to 230 bytes (~190 characters of English text). The serving model is instructed to answer in 2-3 short sentences, and responses are chunked across multiple messages if needed.
+LoRa radio limits each message to 230 bytes (~190 characters of English text). The serving model is told to be concise, and longer answers are split across messages: up to three are sent at once, the rest with `!more`.
 
 **Implication:** Dense, factual source material produces confident, specific answers. Vague source material forces the model to hedge — and hedging is expensive in 230 bytes. Write like you're briefing someone who needs to act on the information.
 
@@ -77,7 +77,7 @@ Different deployments have different knowledge shapes. Pick the pattern that fit
 
 ### The Observatory
 
-**Example:** RIDGELINE wilderness station
+**Examples:** RIDGELINE wilderness station; DAWN-CHORUS birding oracle with live BirdNET detections
 
 A deployed sensor array collects continuous data (cameras, weather, soil moisture) plus manual field observations. The oracle answers questions about what's happening, what to expect, and what's been recorded.
 
@@ -214,8 +214,9 @@ One file, one topic. The builder creates one wiki page per source file by defaul
 
 ### Document structure
 
-You don't need to optimize heading structure for a text chunker — the LLM reads the whole document. But clear structure still matters because it:
+Structure matters twice. At build time the builder LLM reads the whole document. At question time Del-Fi splits the document into sections at each heading (about 700 characters each, with the heading repeated on every piece), ranks them against the question, and sends the best ones to the model. Clear structure:
 
+- Makes each section findable and understandable on its own: name the entity or sound in the heading, and use the words people will ask with, in both singular and plural (matching is by exact word)
 - Helps the builder LLM identify discrete entities to extract
 - Makes source documents easier for you to maintain
 - Produces better cross-references between wiki pages
@@ -309,11 +310,11 @@ The `wiki/` directory is LLM-owned. If you edit a wiki page directly, your chang
 
 **Instead:** Edit the source document in `knowledge/` and re-run `--build-wiki`. The builder will update the wiki page and log the change in `wiki/log.md`.
 
-### Skipping `--build-wiki` after updating sources
+### Turning off the watcher and forgetting to rebuild
 
-The wiki is not automatically rebuilt when you update `knowledge/` files (unless `wiki_rebuild_on_start: true` is set in config). If you update a source and forget to rebuild, the oracle is answering from stale wiki content.
+While the daemon runs, the wiki watcher (`wiki_watch_enabled`, on by default) recompiles changed files within a minute, using the serving model (or `wiki_patch_model`), and removes pages for deleted files; edits made while the daemon was stopped are picked up on its first pass. If you turn the watcher off, run `--build-wiki` after every edit, or the oracle will find documents through out-of-date pages.
 
-Run `--lint-wiki` after updates — it will flag any wiki pages whose source files have been modified since last ingest.
+Run `--lint-wiki` after big changes: it flags orphan and missing pages, stale pages, missing source files and broken cross-references.
 
 ---
 
@@ -345,21 +346,22 @@ wiki_builder_model: "gemma4:12b"  # used only for --build-wiki
 When you update a file in `knowledge/`:
 
 1. Edit the source file
-2. Run `python main.py --build-wiki` — the builder detects changes by MD5 hash and only rebuilds affected wiki pages
+2. If the daemon is running, the watcher recompiles the page within a minute. Otherwise run `python main.py --build-wiki`: it detects changes by MD5 hash and only rebuilds changed files
 3. Run `python main.py --lint-wiki` to verify the wiki is healthy
-
-You can rebuild a single file: `python main.py --build-wiki --file knowledge/weather-station.md`
 
 ### Understanding the wiki build log
 
 Every build run appends to `wiki/log.md`. This is your audit trail:
 
 ```markdown
-## [2026-04-22] build | weather-station.md
-Model: gemma4:12b. Pages touched: weather-station (updated). 1 contradiction resolved.
+## [2026-04-22] ingest | weather-station.md
+Wrote: weather-station.md
+
+## [2026-04-22] prune | old-notes.md
+Removed: old-notes.md
 
 ## [2026-04-22] lint
-Orphan pages: none. Stale: 0. Missing cross-refs: 1 (flora-guide → trail-camera-log).
+Issues: 1 total. 0 orphan, 0 stale, 1 missing cross-refs, 0 missing sources.
 ```
 
 If a build run produces unexpected results, check this log first.
@@ -368,8 +370,7 @@ If a build run produces unexpected results, check this log first.
 
 `--lint-wiki` exits with:
 - `0` — no issues
-- `1` — warnings (orphan pages, missing cross-refs)
-- `2` — errors (stale pages beyond threshold, index drift)
+- `1` — issues found (orphan or missing pages, stale pages, missing sources, missing cross-refs)
 
 Add `python main.py --lint-wiki` to your deployment checklist. CI/CD can gate on the exit code.
 
@@ -384,23 +385,19 @@ time_sensitive_files:
   - trail-camera-log.md
 ```
 
-When these files' wiki pages are included in a query response, the system prepends a freshness header:
+When passages from these files are sent to the model, they carry a freshness header based on the source file's modification time (or the page's `last_ingested` date if the source isn't on this node), so the model can tell users how current the information is:
 
 ```
-[community-log — last ingested 3h ago]
+[community-log — last updated 3h ago]
 ```
 
-If the page is stale (older than `wiki_stale_after_days`), the header warns users:
-
-```
-[STALE: community-log — last ingested 45 days ago, run --build-wiki]
-```
+`--lint-wiki` separately flags pages older than `wiki_stale_after_days`.
 
 ### When to rebuild vs. when to restart
 
 | Action | Command |
 |---|---|
-| Added/edited source documents | `--build-wiki`, then restart daemon |
+| Added/edited source documents | Nothing while the daemon runs: the watcher recompiles within a minute. Or run `--build-wiki` with your builder model |
 | Wiki looks correct, just starting service | `python main.py` |
 | Checking wiki health without changing anything | `--lint-wiki` only |
 | Source files changed, want wiki rebuilt at startup | Set `wiki_rebuild_on_start: true` in config |
@@ -430,22 +427,22 @@ Send `!topics` to your node. It lists the wiki pages available. Each source file
 
 For each topic in `!topics`, send one representative question. A good answer:
 
-1. Cites the right source (shown in the response)
+1. Draws on the right source document (the model is asked to name it when relevant)
 2. Contains specific facts — numbers, names, dates — not vague generalisations
 3. Does not claim uncertainty when the information exists in your source docs
 
 If the oracle says "I don't know" for something that's in your documents:
 
-- Did you run `--build-wiki` after adding or editing the file?
+- Is the page in `!topics`? The watcher or `--build-wiki` must have compiled it
 - Run `--lint-wiki` to check if the wiki page was actually created
-- Try rephrasing the query to use vocabulary from the source document
-- Check `similarity_threshold` — lower values (e.g., 0.20) are more permissive
+- Try rephrasing the query to use vocabulary from the source document; if that works, add the users' wording to the source
+- If you use semantic search (ChromaDB), a lower `similarity_threshold` (e.g., 0.20) is more permissive
 
 ### Step 4: Hallucination test
 
-Ask about something you know is *not* in your documents. The oracle should say:
+Ask about something you know is *not* in your documents. The oracle should say it has no information on that (or give your `fallback_message`), for example:
 
-> "I don't have docs on that. Try !topics to see what I know."
+> "I don't have specific info on that. I know about: ... Try !topics for full list."
 
 If it fabricates an answer, the system prompt may have been modified. Del-Fi's default prompt instructs the LLM to answer *only* from the provided context.
 
@@ -458,7 +455,7 @@ Ask a specific entity query: "Where is [named place]?" or "What are [organizatio
 
 ### Tuning `similarity_threshold`
 
-Controls how closely a wiki page must match the query to be included in context. Lower = more permissive.
+Only used by semantic search (ChromaDB), which Del-Fi tries when keyword search finds no matching page: the minimum similarity for a page to count as a match. Lower = more permissive.
 
 | Symptom | Adjustment |
 |---|---|
@@ -472,12 +469,12 @@ Default is 0.28. Adjust in small steps (0.05 at a time).
 Split when:
 - A single file covers multiple unrelated topics
 - You have a mix of reference material and activity logs
-- `--lint-wiki` reports that a wiki page is too broad to be useful
+- Answers about one entity keep pulling in unrelated sections
 
 ### When to rebuild the wiki
 
-- After any edit to `knowledge/`
-- After adding new source files
+- The watcher handles edits and new files while the daemon runs
+- Run `--build-wiki` when you want your larger builder model to recompile everything
 - When `--lint-wiki` reports stale pages (older than `wiki_stale_after_days`)
 
 ---
@@ -724,19 +721,6 @@ Seasonal patterns at [location]. Covers [topics]. Last reviewed [Month Year].
 ## Spring ([Months])
 
 ...
-
----
-
-## Summer ([Months])
-
-...
-
----
-
-## Fall ([Months])
-
-...
-```
 
 ---
 
