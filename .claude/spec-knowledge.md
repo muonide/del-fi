@@ -59,8 +59,13 @@ class WikiEngine:
 
     def query(self, q, peer_ctx="", history="", board_context="") -> tuple[str, bool]:
         """(answer, had_context). had_context=False → no page matched or the
-        model declined (IDK). Raises LLMError when generation fails."""
+        model declined (IDK). Raises LLMError when generation fails.
+        Records timing in last_stats and logs it (§7.5)."""
 
+    def check_ollama(self) -> bool: ...    # reconnect; re-runs the model check
+    def has_model(self, name: str) -> bool: ...        # pulled in Ollama? (§7.5)
+    def model_info(self, name: str) -> ModelInfo | None: ...  # size, capabilities
+    def warm_up(self) -> float | None: ... # load the serving model; seconds taken
     def lint(self) -> list[str]: ...
     def watch(self, interval: int, stop: threading.Event) -> None: ...
     def num_ctx(self) -> int: ...          # context window sent with answers
@@ -71,6 +76,7 @@ class WikiEngine:
     rag_available: bool    # ChromaDB usable
     wiki_available: bool   # wiki/index.md exists and is non-empty
     page_count: int
+    last_stats: AnswerStats | None   # timing of the latest LLM answer
 
 class LLMError(Exception):
     kind: str              # "unavailable" | "timeout" | "error"
@@ -181,14 +187,16 @@ The build command does **not** start the radio listener. It is a batch job.
 ### 6.2 Per-file processing
 
 ```
+builder model not pulled in Ollama  →  log "run: ollama pull <model>", stop
 full build: prune pages whose tracked source was deleted (see §6.6)
 for each .md/.txt file in knowledge/ (sorted, dotfiles skipped):
     md5(content) == wiki/.hash_cache.json[filename]  →  skip (unchanged)
     prompt = WIKI_BUILD_PROMPT(first 12,000 chars of the source)
-    page = builder_model.generate(prompt, num_ctx=8192)
+    page = builder_model.generate(prompt, num_ctx=8192, think=False if it thinks)
         retry with a larger num_predict while done_reason == "length"
-    strip a ```markdown fence; force frontmatter sources: [<filename>]
-        and last_ingested: <today>, whatever the model wrote
+        Ollama 404 (model missing)  →  stop the build, don't try every file
+    strip <think> blocks and a ```markdown fence; force frontmatter
+        sources: [<filename>] and last_ingested: <today>, whatever the model wrote
     write wiki/<slug>.md, update its index.md row, append to log.md
     record the hash (only now, so a failure anywhere above is retried)
 ```
@@ -319,6 +327,59 @@ When `reorder_context: true` (1B/2B profiles), pages are output in reverse
 rank order so the most relevant one sits next to the question. Small
 models attend better to the end of the context. Reordering happens after
 passage selection, so it cannot exceed the budget.
+
+### 7.5 Models: check, thinking, loading, timing
+
+Any Ollama chat model works; nothing is specific to one family.
+
+**Check.** Whenever the engine connects to Ollama (startup or after an
+outage) it lists the pulled models and asks `ollama show` about the
+serving model:
+
+- serving model not pulled → ERROR `model 'x' is not pulled in Ollama —
+  run: ollama pull x` (names without a tag mean `:latest`; the list is
+  re-read before a model is reported missing, so a later pull is seen)
+- embedding model not pulled while ChromaDB is on → WARNING with the pull
+  command
+- no name profile matched → size profile from the parameter count
+  (spec-config §4)
+- one INFO line with the result: `model qwen3:1.7b: 2.0B, thinking off ·
+  profile small (by size) · context 512 tok, num_ctx 2560, num_predict 300`
+
+**Thinking.** A model whose capabilities include `thinking` (qwen3,
+deepseek-r1, ...) is sent `think: false` for answers and builds: on a
+300-token budget, thinking would use it all before the answer starts. As
+a fallback for servers that ignore it, `<think>…</think>` blocks are cut
+from the output, and an unclosed `<think>` (out of tokens mid-thought)
+leaves no answer, with a warning.
+
+**Loading.** Answers pass `keep_alive: ollama_keep_alive` (default -1,
+keep loaded). The daemon's health thread calls `warm_up()` at startup and
+whenever Ollama comes back: an empty-prompt generate that loads the model
+with the answers' num_ctx (a different num_ctx would reload it on the
+first question), logging `model x loaded in 8.2s` or why it could not.
+
+**Timing.** Each answer logs one INFO line from `AnswerStats`, using
+Ollama's own counters (nanoseconds in the response):
+
+```
+tier1: songs-and-calls, look-alikes (1968 chars of context, 0.03s) · LLM 21.4s:
+    load 0.0s, prompt 812 tok at 61.0 tok/s, output 74 tok at 11.0 tok/s
+```
+
+`load` over a second means the model was loaded for this answer.
+`— stopped at num_predict, answer cut short` is appended when
+`done_reason` is `length`. Missing counters are left out (Ollama omits
+the prompt count when the whole prompt was cached). The dispatcher adds
+the total per question: `✓ response: 2 msg(s), 289B → !id · answered in
+21.5s, queued 0.0s`.
+
+`python main.py --bench [FILE] [--model NAME]` (`del_fi/bench.py`) runs
+the same pipeline on a list of questions (one per line, `#` comments;
+default: one per wiki topic) after a warm-up, and prints each answer with
+its timing and mesh message count, then the median, mean and slowest
+answer and the overall prompt and output rates. It bypasses Tier 0, the
+cache and the radio, so it measures only the model on this hardware.
 
 ---
 

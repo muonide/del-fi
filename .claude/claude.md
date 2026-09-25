@@ -293,12 +293,18 @@ python main.py --lint-wiki [--config PATH]
 python main.py --simulator [--config PATH]
 # Supports sender prefix: !a1b2c3d4> message text
 
+# Benchmark — time answers on this hardware (no radio)
+python main.py --bench [QUESTIONS_FILE] [--config PATH] [--model NAME]
+# One question per line; default: one per wiki topic. --model works in
+# every mode and overrides model from config.yaml (with its profile).
+
 # Web control panel (localhost only)
 python main.py --gui [--config PATH] [--gui-port 5174] [--no-browser]
 ```
 
-`--build-wiki` and `--lint-wiki` are non-destructive, offline operations.
-They do not start the radio listener. They are safe to re-run at any time.
+`--build-wiki`, `--lint-wiki` and `--bench` do not start the radio listener.
+`--build-wiki` and `--lint-wiki` are non-destructive and safe to re-run at
+any time.
 
 ---
 
@@ -308,11 +314,12 @@ They do not start the radio listener. They are safe to re-run at any time.
 
 | File | Class | Responsibility |
 |------|-------|----------------|
-| `main.py` | — | Entrypoint: daemon wiring, `--simulator`, `--build-wiki`, `--lint-wiki`, `--gui` |
-| `del_fi/config.py` | — | YAML loading, validation, defaults, oracle profiles |
+| `main.py` | — | Entrypoint: daemon wiring, `--simulator`, `--build-wiki`, `--lint-wiki`, `--bench`, `--gui` |
+| `del_fi/config.py` | — | YAML loading, validation, defaults, oracle and size profiles |
+| `del_fi/bench.py` | — | `--bench`: timed answers to a question list |
 | `del_fi/core/dispatcher.py` | `Dispatcher` | Main loop: classify, rate limit, bounded queue, worker |
 | `del_fi/core/router.py` | `Router` | Commands, tier hierarchy, response cache, `!more` buffers |
-| `del_fi/core/knowledge.py` | `WikiEngine` | Wiki build, passage retrieval, lint, watcher |
+| `del_fi/core/knowledge.py` | `WikiEngine` | Wiki build, passage retrieval, lint, watcher, model check, answer timing |
 | `del_fi/core/formatter.py` | — | 230-byte enforcement, markdown stripping, chunking |
 | `del_fi/core/facts.py` | `FactStore` | Sensor feed, freshness, Tier 0 |
 | `del_fi/core/peers.py` | `PeerCache`, `GossipDirectory` | Tier 2 storage, Tier 3 gossip |
@@ -437,7 +444,7 @@ block (opt-in). All keys: `.claude/spec-config.md`.
 | `gemma4:e2b`, `gemma3:1b`, `llama3.2:1b` | `similarity_threshold: 0.35`, `rag_top_k: 2`, `max_context_tokens: 512`, `small_model_prompt: true`, `reorder_context: true` |
 | `gemma4:e4b`, `gemma3:4b`, `qwen2.5:3b` | `similarity_threshold: 0.28`, `rag_top_k: 4` |
 | `gemma4:12b` | `similarity_threshold: 0.25`, `rag_top_k: 5`, `max_context_tokens: 3000` |
-| (no match) | Config values as-is |
+| (no match) | By parameter count from Ollama: ≤2.5B like `gemma3:1b`, ≤9B like `gemma4:e4b`, larger like `gemma4:12b` |
 
 ---
 
@@ -449,6 +456,7 @@ del-fi/
 ├── del_fi/                      ← importable package
 │   ├── __init__.py              ← __version__
 │   ├── config.py
+│   ├── bench.py                 ← --bench
 │   ├── core/
 │   │   ├── dispatcher.py        ← main loop, rate limit, worker
 │   │   ├── router.py
@@ -469,8 +477,8 @@ del-fi/
 ├── tests/                       ← one test_X.py per module, plus test_stress.py
 ├── knowledge/                   ← gitignored; deployment-specific raw sources
 ├── wiki/                        ← gitignored; LLM-compiled, rebuilt via --build-wiki
-├── examples/                    ← GUIDE.md, RIDGELINE/, NEIGHBORHOOD/, knowledge-dungeon/,
-│                                   sensor_feed.example.json
+├── examples/                    ← GUIDE.md, DAWN-CHORUS/, RIDGELINE/, NEIGHBORHOOD/,
+│                                   knowledge-dungeon/, sensor_feed.example.json
 ├── docs/index.html              ← project landing page
 ├── config.example.yaml          ← portable template; always commit
 ├── CHANGELOG.md

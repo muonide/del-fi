@@ -57,6 +57,8 @@ Before serving, `--build-wiki` compiles your documents into a small **wiki**: on
 | Jetson Orin Nano Super | ~30 tok/s (3B) | ~15W | ~$249 | Solar field nodes |
 | Mac Mini M4 | ~18 tok/s (7B) | ~30W | ~$499 | Powered stations |
 
+Speeds are rough; `python main.py --bench` measures your own hardware (see [Choosing a Model](#choosing-a-model)).
+
 **Radio:**
 - Any [Meshtastic-supported LoRa radio](https://meshtastic.org/docs/hardware/devices/) — Heltec V3 (~$20) works great
 - Antenna placement matters more than radio choice for range
@@ -229,11 +231,33 @@ response_cache_ttl: 300
 max_context_tokens: 1500        # how much of your documents the model reads
 ollama_host: "http://localhost:11434"
 ollama_timeout: 120
+ollama_keep_alive: -1           # keep the model loaded; or "30m"
 log_level: info
 log_file: ""                    # e.g. delfi.log — rotated at 1 MB
 ```
 
-Small models get tuned defaults automatically (a *profile* matched on the model name): `gemma3:1b`, `llama3.2:1b` and `gemma4:e2b` read less context with a shorter prompt.
+### Choosing a Model
+
+Any Ollama chat model works. When Del-Fi connects to Ollama it checks that your models are pulled (if one isn't, the log gives the `ollama pull` command) and asks Ollama about the serving model:
+
+- **Size.** Small models get tuned defaults (a *profile*): they read less of your documents, with a shorter prompt. `gemma3:1b`, `llama3.2:1b` and `gemma4:e2b` are recognised by name; any other model up to 2.5B parameters (Qwen, Phi, ...) gets the same profile by size, and models over 9B read more. Settings in your config always win.
+- **Thinking.** Reasoning models such as `qwen3` think before they answer, which would use up the whole answer budget (`num_predict: 300`), so Del-Fi turns thinking off.
+- **Loading.** The model is loaded at startup and kept in memory (`ollama_keep_alive: -1`), so no question waits for it to load. `ollama_keep_alive: "30m"` frees the memory after 30 idle minutes.
+
+The startup log shows the result:
+
+```
+model qwen3:1.7b: 2.0B, thinking off · profile small (by size) · context 512 tok, num_ctx 2560, num_predict 300
+```
+
+To compare models on your hardware, ask each the same questions about your documents, one per line in a text file (like [`examples/DAWN-CHORUS/bench-questions.txt`](examples/DAWN-CHORUS/bench-questions.txt)):
+
+```bash
+python main.py --bench questions.txt --model gemma3:1b
+python main.py --bench questions.txt --model qwen3:1.7b
+```
+
+Each answer is printed with its time, the prompt and output speed in tokens per second, and how many mesh messages it takes, then the median and slowest times. It uses your wiki and settings but not the radio, so it measures the model alone. Without a file, `--bench` asks one question per wiki topic.
 
 ### Sensor Data (Tier 0)
 
@@ -324,7 +348,7 @@ What peering will never do:
 
 **"Ollama not available"**
 - Is Ollama running? `curl http://localhost:11434/api/tags`
-- Is the model pulled? `ollama list` should show your configured model
+- Is the model pulled? The log says `model 'x' is not pulled in Ollama — run: ollama pull x` if not
 - Del-Fi retries every 30 seconds. Commands work while waiting, and questions get an honest "my language model isn't reachable" reply instead of a wrong answer
 
 **"No wiki pages loaded"**
@@ -334,9 +358,15 @@ What peering will never do:
 - `python main.py --lint-wiki` reports orphaned pages, missing sources and stale pages
 
 **Slow responses**
+- Each answer's log line says where the time went (see [Reading the Log](#reading-the-log)): prompt time grows with `max_context_tokens`, output time with `num_predict`
+- `python main.py --bench` measures the same on a list of questions; use it to compare models
 - On a Pi, use a 1B model (`gemma3:1b` or `llama3.2:1b`); larger models answer better but much more slowly
 - Lower `max_context_tokens` — the model reads less, answers sooner
 - Large documents are fine: only their relevant sections are sent to the model
+
+**Did my reply arrive?**
+- With `want_ack: true` (the default) the log follows every message part: `✓ delivered`, or `✗ not delivered` with the radio's reason, e.g. `MAX_RETRANSMIT` (no acknowledgement after the radio's retries)
+- `↪ relayed toward` means a neighbouring node passed it on; if no delivery report follows within 3 minutes, the log says so
 
 **Messages getting cut off**
 - LoRa limit is ~230 bytes. Long responses are split and auto-sent up to 3 messages in a row.
@@ -370,9 +400,10 @@ What peering will never do:
 ## Architecture
 
 ```
-main.py                  Entry point: daemon, --simulator, --build-wiki, --lint-wiki, --gui
+main.py                  Entry point: daemon, --simulator, --build-wiki, --lint-wiki, --bench, --gui
 del_fi/
   config.py              YAML loading, validation, defaults, model profiles
+  bench.py               --bench: timed answers to a list of questions
   core/
     dispatcher.py        Main loop: rate limit, question queue, worker thread
     router.py            Commands, tier hierarchy, response cache, !more buffers
@@ -405,10 +436,12 @@ Dependencies: `pyyaml`, `ollama`, `meshtastic`, plus optional `chromadb` (semant
 
 ```
 1. Config        Load YAML, validate, exit with a readable error (the one crash)
-2. Wiki engine   Connect to Ollama (or keep retrying), open ChromaDB if present
+2. Wiki engine   Connect to Ollama (or keep retrying), check the models are
+                 pulled, pick a profile, open ChromaDB if present
 3. Stores        Sensor facts, peer cache, gossip directory, board, memory
 4. Radio         Connect; a supervisor thread reconnects whenever the link drops
-5. Background    Wiki watcher, Ollama health check, cache flush, sensor feed,
+5. Background    Wiki watcher, Ollama health check (loads the model now and
+                 whenever Ollama comes back), cache flush, sensor feed,
                  gossip announcements (if enabled)
 6. Dispatcher    Commands answered inline; questions queued for one worker thread
 ```
@@ -454,6 +487,23 @@ journalctl -u delfi -f               # tail logs
 ```
 
 Adjust `User`, `WorkingDirectory`, and paths if your clone or config is somewhere else.
+
+### Reading the Log
+
+One question answered in two parts looks like this (illustrative numbers):
+
+```
+[07:45:02] tier1: songs-and-calls (1968 chars of context, 0.03s) · LLM 21.4s: load 0.0s, prompt 812 tok at 61.0 tok/s, output 74 tok at 11.0 tok/s
+[07:45:02]   → sent 201B to !7c3e1a2b
+[07:45:03]   → sent 88B to !7c3e1a2b
+[07:45:03]   ✓ response: 2 msg(s), 289B → !7c3e1a2b · answered in 21.5s, queued 0.0s
+[07:45:08]   ✓ delivered to !7c3e1a2b in 5.9s (201B)
+[07:45:11]   ✓ delivered to !7c3e1a2b in 7.8s (88B)
+```
+
+- `tier1:` the documents the answer came from, then the model's time: `load` (over a second means the model had to be loaded first), reading the prompt, and writing the answer, with speeds. `stopped at num_predict` means the answer was cut short.
+- `answered in` is the whole time for the question; `queued` is how long it waited behind other people's questions.
+- `✓ delivered` comes from the recipient's radio. `↪ relayed toward` means a neighbour passed it on; `✗ not delivered` gives the radio's reason.
 
 ### Pi Thermal Tips
 

@@ -200,6 +200,12 @@ class TestDawnChorusNode(unittest.TestCase):
             self.assertIn(marker, reply, question)
             self.assertNotIn("STALE", reply, question)
 
+    def test_bench_questions_load(self):
+        from del_fi.bench import load_questions
+        questions = load_questions(DAWN / "bench-questions.txt")
+        self.assertGreaterEqual(len(questions), 8)
+        self.assertIn("I heard a bird that goes fee-bee", questions)
+
     def test_cross_referenced_files_exist(self):
         docs = list((DAWN / "knowledge").glob("*.md"))
         self.assertGreaterEqual(len(docs), 10)

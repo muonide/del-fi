@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+Tools for testing on real hardware: see where each answer's time goes,
+whether each reply reached its recipient, and which model suits the machine.
+
+### Measuring
+
+- **Answer timing in the log.** Every answer logs the pages it used and the
+  model's time: loading, reading the prompt and writing the answer, with
+  token counts and speeds reported by Ollama. The response line adds the
+  total time and how long the question waited in the queue.
+- **Delivery reports.** With `want_ack: true`, each message part is
+  followed to the end: delivered (the recipient's ACK), relayed by a
+  neighbour, or not delivered with the radio's reason (`MAX_RETRANSMIT`,
+  `NO_ROUTE`, ...). Parts never confirmed are reported after 3 minutes.
+- **`python main.py --bench [FILE]`** asks a list of questions (default: one
+  per wiki topic) and prints each answer with its timing and mesh message
+  count, then the median and slowest times. `--model NAME` replaces the
+  configured model in any mode, so models can be compared without editing
+  the config. `examples/DAWN-CHORUS/bench-questions.txt` is a sample list.
+
+### Models
+
+- **Any Ollama model.** When it connects to Ollama, Del-Fi checks that the
+  serving and embedding models are pulled (logging the `ollama pull`
+  command if not) and reads the serving model's size and capabilities.
+  `--build-wiki` stops with the same advice when the builder model is
+  missing, instead of failing on every file.
+- **Size profiles.** Models without a profile by name (Qwen, Phi, Mistral,
+  ...) get one by parameter count: up to 2.5B like `gemma3:1b`, up to 9B
+  like `gemma4:e4b`, larger like `gemma4:12b`. Keys set in config.yaml win.
+- **Thinking off.** Reasoning models such as `qwen3` are asked not to think:
+  thinking would spend the whole answer budget before the answer. Any
+  `<think>` text that still comes back is removed from answers and wiki
+  pages.
+- **No cold starts.** The model is loaded at startup and whenever Ollama
+  comes back, with the same context window as answers, and stays loaded
+  (`ollama_keep_alive`, default `-1`).
+
+### Upgrading
+
+- Ollama now keeps the serving model in memory between questions. To free
+  the memory when the node is idle, set `ollama_keep_alive: "30m"` (Ollama's
+  own default is 5 minutes).
+
 ## 0.3 — "Make it true" (2026-09-25)
 
 v0.3 makes the documentation true: every feature the README describes either
