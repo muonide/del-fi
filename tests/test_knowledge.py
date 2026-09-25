@@ -5,11 +5,11 @@ get_topics, and suggest. All Ollama and ChromaDB calls are mocked.
 """
 
 import hashlib
-import io
+import json
 import os
-import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from datetime import date, timedelta
@@ -77,7 +77,7 @@ class _FakeOllamaClient:
         return {"models": []}
 
     def generate(self, model: str, prompt: str, options: dict = None, stream: bool = False, **kwargs):
-        self.generate_calls.append({"model": model, "prompt": prompt, **kwargs})
+        self.generate_calls.append({"model": model, "prompt": prompt, "options": options, **kwargs})
 
         class _Resp:
             pass
@@ -647,6 +647,336 @@ class TestConcurrency(unittest.TestCase):
 
         self.assertEqual(errors, [], f"Concurrent query errors: {errors}")
         self.assertEqual(len(results), 8)
+
+
+# ---------------------------------------------------------------------------
+# v0.3: passage selection and context budget
+# ---------------------------------------------------------------------------
+
+
+def _index_row(slug, summary, tags):
+    return f"| [[{slug}]] | {summary} | {tags} | {date.today().isoformat()} |"
+
+
+def _setup_pages(tmpdir, pages):
+    """pages: {slug: (tags, raw_source_text or None)}. Writes wiki pages,
+    index.md, and knowledge/<slug>.md sources."""
+    wiki_dir = os.path.join(tmpdir, "wiki")
+    rows = []
+    for slug, (tags, source) in pages.items():
+        page = (
+            f"---\ntitle: {slug}\ntags: [{', '.join(tags)}]\n"
+            f"sources: [{slug}.md]\nlast_ingested: {date.today().isoformat()}\n---\n\n"
+            f"# {slug}\n\nIndex page for {slug}.\n"
+        )
+        _write_file(os.path.join(wiki_dir, f"{slug}.md"), page)
+        rows.append(_index_row(slug, f"About {slug}.", ", ".join(tags)))
+        if source is not None:
+            _write_file(os.path.join(tmpdir, "knowledge", f"{slug}.md"), source)
+    _write_file(
+        os.path.join(wiki_dir, "index.md"),
+        "# Wiki Index\n\n| Page | Summary | Tags | Updated |\n|---|---|---|---|\n"
+        + "\n".join(rows) + "\n",
+    )
+
+
+def _big_source(topic, n_sections=12):
+    sections = []
+    for i in range(n_sections):
+        sections.append(f"## Section {i}\n\n" + f"Filler text about routine matters {i}. " * 15)
+    sections.insert(5, f"## {topic.title()} Details\n\nThe {topic} gathering spot is Willow Flats at dawn.")
+    return "# Guide\n\n" + "\n\n".join(sections)
+
+
+class TestPassages(unittest.TestCase):
+    def test_sections_split_with_heading_repeated(self):
+        from del_fi.core.knowledge import split_passages
+        text = "---\ntitle: x\n---\n# Title\n\nIntro para.\n\n## Elk\n\n" + ("Elk fact. " * 150)
+        passages = split_passages(text, max_chars=300)
+        self.assertEqual(passages[0], "# Title\nIntro para.")
+        elk = [p for p in passages if p.startswith("## Elk")]
+        self.assertGreater(len(elk), 2, "long section should be cut into several passages")
+        self.assertTrue(all(len(p) <= 300 for p in elk))
+        self.assertNotIn("title: x", "\n".join(passages))
+
+    def test_long_line_is_split(self):
+        from del_fi.core.knowledge import split_passages
+        passages = split_passages("word " * 400, max_chars=200)
+        self.assertGreater(len(passages), 5)
+        self.assertTrue(all(len(p) <= 200 for p in passages))
+
+
+class TestContextBudget(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-ctx-")
+
+    def _prompt(self, engine, client, question):
+        engine.query(question)
+        return client.generate_calls[-1]["prompt"]
+
+    def test_relevant_passage_selected_from_large_source(self):
+        _setup_pages(self.tmpdir, {"elk-guide": (["elk", "wildlife"], _big_source("elk"))})
+        client = _FakeOllamaClient(generate_response="At Willow Flats.")
+        engine = _make_engine(self.tmpdir, ollama_client=client, max_context_tokens=150,
+                              num_ctx=None)
+        prompt = self._prompt(engine, client, "where do the elk gather?")
+        self.assertIn("Willow Flats", prompt)
+        self.assertLess(len(prompt), 150 * 4 + 400)
+
+    def test_small_model_profile_respects_budget_with_reorder(self):
+        """v0.2 bug: reorder_context rebuilt the context from untrimmed parts."""
+        pages = {f"elk-{n}": (["elk"], _big_source("elk")) for n in ("guide", "log", "map")}
+        _setup_pages(self.tmpdir, pages)
+        client = _FakeOllamaClient(generate_response="Elk are near the meadow.")
+        engine = _make_engine(self.tmpdir, ollama_client=client, max_context_tokens=512,
+                              reorder_context=True, small_model_prompt=True, num_ctx=None)
+        prompt = self._prompt(engine, client, "where are the elk")
+        context = prompt.split("Question:")[0]
+        self.assertLessEqual(len(context), 512 * 4 + 40)
+
+    def test_reorder_puts_top_page_last(self):
+        _setup_pages(self.tmpdir, {
+            "elk-guide": (["elk", "herd", "migration"], "## Elk\n\nElk herd migration route east."),
+            "deer-notes": (["deer", "elk"], "## Deer\n\nDeer sometimes mix with elk."),
+        })
+        client = _FakeOllamaClient(generate_response="East.")
+        engine = _make_engine(self.tmpdir, ollama_client=client, reorder_context=True)
+        prompt = self._prompt(engine, client, "elk herd migration")
+        self.assertLess(prompt.index("[deer-notes]"), prompt.index("[elk-guide]"))
+
+    def test_sources_resolved_by_basename_only(self):
+        secret = os.path.join(self.tmpdir, "secret.md")
+        _write_file(secret, "TOP SECRET elk data")
+        wiki_dir = os.path.join(self.tmpdir, "wiki")
+        _write_file(os.path.join(wiki_dir, "elk.md"),
+                    "---\ntitle: Elk\ntags: [elk]\nsources: [../secret.md]\n---\n\n# Elk\n\nElk page.\n")
+        _write_file(os.path.join(wiki_dir, "index.md"),
+                    "| Page | Summary | Tags | Updated |\n|---|---|---|---|\n"
+                    + _index_row("elk", "Elk page.", "elk") + "\n")
+        client = _FakeOllamaClient(generate_response="Elk.")
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        prompt = self._prompt(engine, client, "elk")
+        self.assertNotIn("TOP SECRET", prompt)
+        self.assertIn("Elk page.", prompt)
+
+    def test_num_ctx_derived_and_sent(self):
+        client = _FakeOllamaClient(generate_response="ok.")
+        engine = _make_engine(self.tmpdir, ollama_client=client, num_ctx=None,
+                              max_context_tokens=None, num_predict=300)
+        self.assertEqual(engine.num_ctx(), 3584)
+        engine2 = _make_engine(self.tmpdir, ollama_client=client, num_ctx=1024)
+        self.assertEqual(engine2.num_ctx(), 1024)
+
+    def test_generate_passes_stable_num_ctx(self):
+        _setup_pages(self.tmpdir, {"elk-guide": (["elk"], "## Elk\n\nElk live here.")})
+        client = _FakeOllamaClient(generate_response="Here.")
+        engine = _make_engine(self.tmpdir, ollama_client=client, num_ctx=None)
+        engine.query("elk")
+        engine.query("elk live")
+        ctxs = {c["options"]["num_ctx"] for c in client.generate_calls}
+        self.assertEqual(ctxs, {engine.num_ctx()})
+
+    def test_no_shared_keywords_reads_top_page_from_start(self):
+        _setup_pages(self.tmpdir, {"elk-guide": (["elk"], "## Intro\n\nFirst passage.\n\n## More\n\nSecond.")})
+        client = _FakeOllamaClient(generate_response="ok.")
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        context = engine._build_context("zzz", ["elk-guide"], budget=5000)
+        self.assertLess(context.index("First passage"), context.index("Second"))
+
+    def test_staleness_uses_source_mtime(self):
+        _setup_pages(self.tmpdir, {"weather-station": (["weather"], "## Now\n\nWind 12 mph.")})
+        src = os.path.join(self.tmpdir, "knowledge", "weather-station.md")
+        three_hours_ago = time.time() - 3 * 3600
+        os.utime(src, (three_hours_ago, three_hours_ago))
+        client = _FakeOllamaClient(generate_response="12 mph.")
+        engine = _make_engine(self.tmpdir, ollama_client=client,
+                              time_sensitive_files=["weather-station.md"])
+        prompt = self._prompt(engine, client, "weather wind")
+        self.assertIn("[weather-station — last updated 3 hrs ago]", prompt)
+
+
+class TestIdkAndSearch(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-idk-")
+
+    def test_idk_detection_checks_first_sentence(self):
+        engine = _make_engine(self.tmpdir)
+        self.assertTrue(engine._is_idk_response("I don't know."))
+        self.assertTrue(engine._is_idk_response("I'm not sure. The docs cover elk."))
+        self.assertFalse(engine._is_idk_response("The trail is 3 miles. I'm not sure about ice."))
+        self.assertFalse(engine._is_idk_response("I'm not sure, but the log shows elk at dawn."))
+
+    def test_content_search_matches_whole_words(self):
+        wiki_dir = os.path.join(self.tmpdir, "wiki")
+        _write_file(os.path.join(wiki_dir, "events.md"), "# Events\n\nThe start of the party.")
+        _write_file(os.path.join(wiki_dir, "gallery.md"), "# Gallery\n\nLocal art on display.")
+        engine = _make_engine(self.tmpdir)
+        self.assertEqual(engine._content_search("art"), ["gallery"])
+
+    def test_topics_ignore_cross_refs_in_summary(self):
+        wiki_dir = os.path.join(self.tmpdir, "wiki")
+        _write_file(os.path.join(wiki_dir, "index.md"),
+                    "| Page | Summary | Tags | Updated |\n|---|---|---|---|\n"
+                    "| [[elk-guide]] | See [[not-a-page]]. | elk | 2026-01-01 |\n"
+                    "| [[flora]] | Plants. | plants | 2026-01-01 |\n")
+        engine = _make_engine(self.tmpdir)
+        self.assertEqual(engine.get_topics(), ["Elk Guide", "Flora"])
+
+
+class _ScriptedBuildClient(_FakeOllamaClient):
+    """Returns (text, done_reason) pairs in order."""
+
+    def __init__(self, replies):
+        super().__init__()
+        self.replies = list(replies)
+
+    def generate(self, model, prompt, options=None, stream=False, **kwargs):
+        self.generate_calls.append({"model": model, "prompt": prompt, "options": options})
+        text, reason = self.replies.pop(0) if self.replies else ("", "stop")
+
+        class _Resp:
+            pass
+
+        r = _Resp()
+        r.response, r.done_reason = text, reason
+        return r
+
+
+class TestBuildV03(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-build-")
+
+    def _engine(self, client, **cfg):
+        engine = _make_engine(self.tmpdir, ollama_client=client, **cfg)
+        return engine, engine.cfg["knowledge_folder"], engine.cfg["wiki_folder"]
+
+    def test_done_reason_stop_accepted_without_punctuation(self):
+        client = _ScriptedBuildClient([("---\ntitle: X\n---\n# X\n\nTags list", "stop")])
+        engine, kdir, _ = self._engine(client)
+        _write_file(os.path.join(kdir, "x.md"), "source")
+        self.assertEqual(engine.build(), 1)
+        self.assertEqual(len(client.generate_calls), 1)
+
+    def test_done_reason_length_retries(self):
+        client = _ScriptedBuildClient([("---\ntitle: X\n---\ncut off.", "length"),
+                                       ("---\ntitle: X\n---\n# X\n\nComplete.", "stop")])
+        engine, kdir, _ = self._engine(client)
+        _write_file(os.path.join(kdir, "x.md"), "source")
+        engine.build()
+        self.assertEqual(len(client.generate_calls), 2)
+        self.assertEqual(client.generate_calls[0]["options"]["num_ctx"], 8192)
+
+    def test_frontmatter_forced_to_real_source(self):
+        client = _ScriptedBuildClient([
+            ("```markdown\n---\ntitle: Elk\nsources: [made-up.md]\nlast_ingested: 1999-01-01\n---\n# Elk\n\nElk.\n```", "stop"),
+        ])
+        engine, kdir, wdir = self._engine(client)
+        _write_file(os.path.join(kdir, "elk-guide.md"), "Elk.")
+        engine.build()
+        page = Path(wdir, "elk-guide.md").read_text()
+        self.assertTrue(page.startswith("---\ntitle: Elk\n"))
+        self.assertIn("sources: [elk-guide.md]", page)
+        self.assertIn(f"last_ingested: {date.today().isoformat()}", page)
+        self.assertNotIn("made-up", page)
+        self.assertNotIn("```", page)
+
+    def test_backslash_in_llm_tags_does_not_break_index(self):
+        page = "---\ntitle: X\ntags: [data, C:\\data\\new, a|b]\n---\n# X\n\nSome text here.\n"
+        client = _ScriptedBuildClient([(page, "stop"), (page.replace("Some", "Other"), "stop")])
+        engine, kdir, wdir = self._engine(client)
+        _write_file(os.path.join(kdir, "x.md"), "v1")
+        engine.build()
+        _write_file(os.path.join(kdir, "x.md"), "v2")  # second build replaces the row
+        self.assertEqual(engine.build(), 1)
+        index = Path(wdir, "index.md").read_text()
+        self.assertIn("C:\\data\\new", index)
+        self.assertEqual(index.count("[[x]]"), 1)
+        self.assertIn("a/b", index)
+
+    def test_md_and_txt_with_same_stem_get_separate_pages(self):
+        client = _ScriptedBuildClient([("---\ntitle: A\n---\n# A\n\nA.", "stop")] * 2)
+        engine, kdir, wdir = self._engine(client)
+        _write_file(os.path.join(kdir, "notes.md"), "md version")
+        _write_file(os.path.join(kdir, "notes.txt"), "txt version")
+        self.assertEqual(engine.build(), 2)
+        self.assertTrue(Path(wdir, "notes.md").exists())
+        self.assertTrue(Path(wdir, "notes-txt.md").exists())
+
+    def test_hash_cache_keys_are_filenames_and_migrate(self):
+        client = _ScriptedBuildClient([("---\ntitle: A\n---\n# A\n\nA.", "stop")])
+        engine, kdir, wdir = self._engine(client)
+        _write_file(os.path.join(kdir, "a.md"), "alpha")
+        engine.build()
+        cache = json.loads(Path(wdir, ".hash_cache.json").read_text())
+        self.assertEqual(list(cache), ["a.md"])
+
+        # A v0.2 cache written on another machine (absolute paths).
+        Path(wdir, ".hash_cache.json").write_text(json.dumps(
+            {"/Users/alice/del-fi/knowledge/a.md": cache["a.md"]}))
+        engine2, _, _ = self._engine(_ScriptedBuildClient([]))
+        self.assertEqual(engine2._detect_changes(), [])
+
+    def test_failed_index_update_is_retried(self):
+        client = _ScriptedBuildClient([("---\ntitle: A\n---\n# A\n\nA.", "stop")] * 2)
+        engine, kdir, _ = self._engine(client)
+        _write_file(os.path.join(kdir, "a.md"), "alpha")
+        with unittest.mock.patch.object(engine, "_update_index", side_effect=OSError("disk full")):
+            self.assertEqual(engine.build(), 0)
+        self.assertEqual(engine.build(), 1)
+
+
+class TestPruneAndWatch(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-prune-")
+
+    def _built_engine(self, names):
+        replies = [(f"---\ntitle: {n}\n---\n# {n}\n\nAbout {n}.", "stop") for n in names]
+        engine = _make_engine(self.tmpdir, ollama_client=_ScriptedBuildClient(replies))
+        for n in names:
+            _write_file(os.path.join(engine.cfg["knowledge_folder"], f"{n}.md"), f"{n} source")
+        engine.build()
+        return engine, engine.cfg["knowledge_folder"], engine.cfg["wiki_folder"]
+
+    def test_deleted_source_removes_page_and_index_row(self):
+        engine, kdir, wdir = self._built_engine(["alpha", "beta"])
+        os.remove(os.path.join(kdir, "beta.md"))
+        self.assertEqual(engine.prune_removed_sources(), ["beta"])
+        self.assertFalse(Path(wdir, "beta.md").exists())
+        index = Path(wdir, "index.md").read_text()
+        self.assertIn("[[alpha]]", index)
+        self.assertNotIn("[[beta]]", index)
+        self.assertIn("prune | beta.md", Path(wdir, "log.md").read_text())
+
+    def test_empty_knowledge_folder_never_prunes(self):
+        engine, kdir, wdir = self._built_engine(["alpha"])
+        os.remove(os.path.join(kdir, "alpha.md"))
+        self.assertEqual(engine.prune_removed_sources(), [])
+        self.assertTrue(Path(wdir, "alpha.md").exists())
+
+    def test_watch_disabled_starts_no_thread(self):
+        engine = _make_engine(self.tmpdir, wiki_watch_enabled=False)
+        before = threading.active_count()
+        engine.watch(1, threading.Event())
+        self.assertEqual(threading.active_count(), before)
+
+    def test_watch_rebuilds_with_serving_model(self):
+        client = _ScriptedBuildClient([("---\ntitle: A\n---\n# A\n\nA.", "stop")])
+        engine = _make_engine(self.tmpdir, ollama_client=client,
+                              wiki_builder_model="huge-model:70b")
+        _write_file(os.path.join(engine.cfg["knowledge_folder"], "a.md"), "alpha")
+        stop = threading.Event()
+        engine.watch(60, stop)
+        deadline = time.time() + 3
+        while not client.generate_calls and time.time() < deadline:
+            time.sleep(0.02)
+        stop.set()
+        self.assertEqual(client.generate_calls[0]["model"], "test-model:3b")
+
+    def test_lint_flags_missing_source_only_with_knowledge_folder(self):
+        engine, kdir, wdir = self._built_engine(["alpha", "beta"])
+        os.remove(os.path.join(kdir, "beta.md"))  # not pruned yet
+        issues = engine.lint()
+        self.assertTrue(any("missing source: beta.md" in i for i in issues), issues)
 
 
 if __name__ == "__main__":

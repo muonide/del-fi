@@ -6,66 +6,72 @@ Three layers:
   .claude/     — wiki schema / spec (always tracked in git)
 
 Build pipeline (--build-wiki):
-  1. Scan knowledge/ for .md and .txt files
-  2. Skip unchanged files (MD5 hash check)
+  1. Scan knowledge/ for .md and .txt files; drop pages whose source is gone
+  2. Skip unchanged files (MD5 hash check, keyed by filename)
   3. For each changed file: prompt the LLM to extract entities and write
-     a structured wiki page with YAML frontmatter
+     a structured wiki page with YAML frontmatter (a search index)
   4. Write wiki/<slug>.md, update wiki/index.md, append to wiki/log.md
 
 Query pipeline (Tier 1):
-  1. BM25 keyword search on wiki/index.md titles and tags
-  2. Read top 2–3 wiki pages as context
-  3. Optional: ChromaDB vector search on wiki-page embeddings
-  4. Assemble context string and pass to serving LLM
+  1. Find pages: BM25 on wiki/index.md, then vector search, then page bodies
+  2. Split the top pages' source files into passages (one section each)
+  3. Rank passages against the question and fill the context budget
+  4. Ask the serving LLM to answer from those passages only
 """
 
 import hashlib
 import json
 import logging
 import math
-import os
 import re
 import threading
 import time
-from datetime import date, datetime, timezone
+from collections import Counter
+from datetime import date
 from pathlib import Path
+
+from del_fi.core.fsutil import write_atomic
+from del_fi.core.text import tokenize
 
 log = logging.getLogger("del_fi.core.knowledge")
 
-# Stop words for BM25 keyword extraction
-_STOP_WORDS = frozenset({
-    "a", "an", "the", "is", "it", "in", "on", "at", "to", "for",
-    "of", "and", "or", "not", "be", "are", "was", "were", "do",
-    "does", "did", "has", "have", "had", "can", "could", "will",
-    "would", "should", "may", "might", "i", "me", "my", "you",
-    "your", "we", "our", "they", "them", "their", "what", "where",
-    "when", "how", "who", "which", "that", "this", "there",
-    "here", "with", "from", "about", "into", "if", "so", "than",
-    "but", "just", "any", "some", "all", "no", "yes",
-})
+# Context sizing. Token counts are estimated at CHARS_PER_TOKEN chars each.
+CHARS_PER_TOKEN = 4
+DEFAULT_CONTEXT_TOKENS = 1500      # retrieved passages, when max_context_tokens is unset
+PROMPT_OVERHEAD_TOKENS = 1024      # system prompt, history, board posts, question
+MIN_CONTEXT_CHARS = 600
+MAX_CONTEXT_PAGES = 3
+PASSAGE_CHARS = 700
+_RANK_WEIGHTS = (1.0, 0.8, 0.65)   # passage score multiplier by page rank
+
+# Build sizing: only this much of a source goes into the build prompt, with a
+# fixed context window so Ollama never truncates the prompt (or reloads the
+# model because num_ctx changed between files).
+BUILD_SOURCE_CHARS = 12000
+BUILD_NUM_CTX = 8192
 
 # Compact system prompt for small models
 SMALL_MODEL_SYSTEM = (
     "You are {name}, a community assistant. {personality} "
-    "You are given a wiki index summary followed by the full source document(s) it indexes. "
-    "Answer using ONLY the source content below. "
-    "If the source does not directly answer the question, share the most relevant "
-    "information from it and note what it covers. Never state facts not in the source. "
+    "You are given excerpts from local documents. "
+    "Answer using ONLY the excerpts below. "
+    "If they do not directly answer the question, share the most relevant "
+    "information from them and note what they cover. Never state facts not in them. "
     "Be brief. 1-3 sentences maximum."
 )
 
 STANDARD_SYSTEM = (
     "You are {name}, a community assistant. {personality} "
-    "You are given a wiki index summary followed by the full source document(s) it indexes. "
-    "Answer using ONLY the provided source content. "
-    "If the source does not directly answer the question, share the closest relevant "
-    "information it does contain and briefly note what topic it covers. "
-    "Never state facts not in the source. "
+    "You are given excerpts from local documents. "
+    "Answer using ONLY the provided excerpts. "
+    "If they do not directly answer the question, share the closest relevant "
+    "information they do contain and briefly note what topic they cover. "
+    "Never state facts not in the excerpts. "
     "Be concise and factual. Cite the source document name when relevant."
 )
 
 # Short phrases that indicate the LLM refused to answer from context.
-# Used to detect useless responses and fall through to suggest().
+# Used to detect useless responses and fall through to the next tier.
 _IDK_PATTERNS = (
     "i don't know",
     "i do not know",
@@ -84,6 +90,11 @@ _IDK_PATTERNS = (
     "can't answer",
     "no information available",
 )
+
+_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---[ \t]*\n?", re.DOTALL)
+_HEADING = re.compile(r"^#{1,6}\s+\S")
+_FIRST_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
 
 class LLMError(Exception):
     """Answer generation failed.
@@ -163,8 +174,9 @@ class WikiEngine:
 
     Public interface
     ----------------
-    build(file=None)                  compile knowledge/ → wiki/
-    query(q, peer_ctx, history)       BM25 + LLM → answer string
+    build(file=None, model=None)      compile knowledge/ → wiki/
+    prune_removed_sources()           drop pages whose source was deleted
+    query(q, peer_ctx, history, ...)  retrieve passages + LLM → (answer, had_context)
     lint()                            health check → list of issue strings
     watch(interval, stop)             background knowledge watcher
     available                         True when Ollama is reachable
@@ -183,7 +195,7 @@ class WikiEngine:
         self._collection = None
         self._rag_available = False
         self._lock = threading.Lock()
-        self._file_hashes: dict[str, str] = {}
+        self._file_hashes: dict[str, str] = {}   # source filename -> md5
         self._hash_cache_file = self._wiki_dir / ".hash_cache.json"
 
         self._init_ollama()
@@ -220,7 +232,7 @@ class WikiEngine:
             import chromadb
             from chromadb.config import Settings
             db_path = self.cfg["_vectorstore_dir"]
-            os.makedirs(db_path, exist_ok=True)
+            Path(db_path).mkdir(parents=True, exist_ok=True)
             client = chromadb.PersistentClient(
                 path=db_path,
                 settings=Settings(anonymized_telemetry=False),
@@ -268,10 +280,12 @@ class WikiEngine:
 
     # --- Build pipeline ---
 
-    def build(self, file: str | None = None) -> int:
+    def build(self, file: str | None = None, model: str | None = None) -> int:
         """Compile knowledge/ → wiki/.
 
-        If *file* is given, only (re)process that file.
+        If *file* is given, only (re)process that file. A full build also
+        removes pages whose source file has been deleted. *model* overrides
+        wiki_builder_model (the watcher passes the serving model).
         Returns the number of wiki pages written.
         """
         self._wiki_dir.mkdir(parents=True, exist_ok=True)
@@ -280,32 +294,32 @@ class WikiEngine:
             log.error("ollama not available — cannot build wiki")
             return 0
 
-        builder_model = self.cfg.get("wiki_builder_model") or self.cfg["model"]
+        builder_model = model or self.cfg.get("wiki_builder_model") or self.cfg["model"]
         log.info(f"building wiki with model {builder_model!r}")
 
         if file:
             targets = [Path(file)]
         else:
-            targets = list(self._knowledge_dir.glob("*.md")) + list(
-                self._knowledge_dir.glob("*.txt")
-            )
+            self.prune_removed_sources()
+            targets = self._source_files()
 
-        written = 0
+        written: list[str] = []
         for path in targets:
             try:
-                if self._build_page(path, builder_model):
-                    written += 1
-            except Exception as e:
-                log.error(f"build failed for {path.name}: {e}")
+                slug = self._build_page(path, builder_model)
+            except Exception:
+                log.exception(f"build failed for {path.name}")
+                continue
+            if slug:
+                written.append(slug)
 
         self._save_hash_cache()
 
         if written:
-            log.info(f"wiki build complete: {written} page(s) written")
-            # Re-embed updated pages
-            self._embed_wiki_pages()
+            log.info(f"wiki build complete: {len(written)} page(s) written")
+            self._embed_wiki_pages(written)
 
-        return written
+        return len(written)
 
     # Build token budget: enough for a complete wiki page (≤600 words ≈ 800 tokens)
     # plus frontmatter. We use 1600 to give headroom; the larger builder model
@@ -314,7 +328,8 @@ class WikiEngine:
     _BUILD_NUM_PREDICT_RETRY = 2400  # wider budget for retry pass
 
     def _is_truncated(self, text: str) -> bool:
-        """Return True when the LLM output appears to have been cut mid-generation."""
+        """Heuristic: True when the LLM output appears to have been cut
+        mid-generation. Only used when Ollama does not report done_reason."""
         if not text:
             return True
         stripped = text.rstrip()
@@ -339,19 +354,28 @@ class WikiEngine:
         budgets = [self._BUILD_NUM_PREDICT] + [self._BUILD_NUM_PREDICT_RETRY] * max_retries
 
         client = self._ollama_build or self._ollama
+        text = ""
         for attempt, budget in enumerate(budgets):
             try:
                 response = client.generate(
                     model=model,
                     prompt=prompt,
-                    options={"num_predict": budget, "temperature": 0.1},
+                    options={
+                        "num_predict": budget,
+                        "num_ctx": BUILD_NUM_CTX,
+                        "temperature": 0.1,
+                    },
                 )
-                text = response.response.strip()
+                text = _strip_code_fence(response.response.strip())
+                done_reason = getattr(response, "done_reason", None)
             except Exception as e:
                 log.error(f"LLM build failed for {filename} (attempt {attempt + 1}): {e}")
                 return None
 
-            if not self._is_truncated(text):
+            # Ollama reports done_reason="length" when it hit num_predict;
+            # fall back to a punctuation heuristic for clients that don't.
+            truncated = done_reason == "length" if done_reason else self._is_truncated(text)
+            if not truncated:
                 if attempt > 0:
                     log.info(f"  {filename}: truncation resolved on attempt {attempt + 1}")
                 return text
@@ -369,107 +393,161 @@ class WikiEngine:
         )
         return text
 
-    def _build_page(self, source_path: Path, model: str) -> bool:
-        """Build a single wiki page from a source file. Returns True if written."""
+    def _build_page(self, source_path: Path, model: str) -> str | None:
+        """Build one wiki page from a source file. Returns its slug if written."""
         try:
             content = source_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             log.warning(f"cannot read {source_path.name}: {e}")
-            return False
+            return None
 
         content_hash = hashlib.md5(content.encode()).hexdigest()
-        key = str(source_path)
-
+        key = source_path.name
         with self._lock:
             if self._file_hashes.get(key) == content_hash:
-                return False  # unchanged
-            self._file_hashes[key] = content_hash
+                return None  # unchanged
+
+        if len(content) > BUILD_SOURCE_CHARS:
+            log.warning(
+                f"  {source_path.name}: {len(content)} chars — only the first "
+                f"{BUILD_SOURCE_CHARS} are indexed; split the file so keyword "
+                f"search can find the rest"
+            )
 
         today = date.today().isoformat()
         prompt = WIKI_BUILD_PROMPT.format(
             filename=source_path.name,
             today=today,
-            content=content[:12000],  # cap to ~3k tokens for build context
+            content=content[:BUILD_SOURCE_CHARS],
         )
 
         log.info(f"  compiling {source_path.name} → wiki...")
         wiki_text = self._generate_wiki_page(source_path.name, prompt, model)
         if wiki_text is None:
-            with self._lock:
-                del self._file_hashes[key]  # allow retry next time
-            return False
+            return None  # hash not recorded, so it is retried next time
+        wiki_text = _normalise_frontmatter(wiki_text, source_path, today)
 
-        # Derive wiki page slug from source filename
-        slug = re.sub(r"[^\w-]", "-", source_path.stem.lower()).strip("-")
+        slug = self._slug_for(source_path)
         wiki_path = self._wiki_dir / f"{slug}.md"
+        if not write_atomic(str(wiki_path), wiki_text):
+            return None
 
-        # Atomic write
-        tmp = wiki_path.with_suffix(".tmp")
-        tmp.write_text(wiki_text, encoding="utf-8")
-        tmp.replace(wiki_path)
-
-        self._update_index(slug, wiki_path, source_path.name, today)
+        self._update_index(slug, wiki_path, today)
         self._append_log(f"[{today}] ingest | {source_path.name}\nWrote: {slug}.md")
+        with self._lock:
+            self._file_hashes[key] = content_hash
         log.info(f"  wrote wiki/{slug}.md")
-        return True
+        return slug
 
-    def _update_index(
-        self, slug: str, wiki_path: Path, source_name: str, today: str
-    ):
-        """Update the wiki/index.md table entry for this page."""
+    def _slug_for(self, source: Path) -> str:
+        slug = re.sub(r"[^\w-]", "-", source.stem.lower()).strip("-") or "page"
+        if source.suffix.lower() == ".txt" and (self._knowledge_dir / f"{source.stem}.md").exists():
+            slug += "-txt"  # foo.md and foo.txt would otherwise share wiki/foo.md
+        return slug
+
+    def _source_files(self) -> list[Path]:
+        if not self._knowledge_dir.is_dir():
+            return []
+        return sorted(
+            p for ext in ("*.md", "*.txt") for p in self._knowledge_dir.glob(ext)
+            if p.is_file() and not p.name.startswith(".")
+        )
+
+    def _update_index(self, slug: str, wiki_path: Path, today: str):
+        """Insert or replace the wiki/index.md table row for this page."""
         index_path = self._wiki_dir / "index.md"
 
-        # Parse frontmatter to extract title, tags, summary
         text = wiki_path.read_text(encoding="utf-8", errors="replace")
-        title = slug
         tags = ""
         summary = ""
-
-        fm_match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+        fm_match = _FRONTMATTER.match(text)
         if fm_match:
-            fm = fm_match.group(1)
-            t = re.search(r"^title:\s*(.+)$", fm, re.MULTILINE)
-            if t:
-                title = t.group(1).strip().strip('"')
-            tg = re.search(r"^tags:\s*\[(.+)\]", fm, re.MULTILINE)
+            tg = re.search(r"^tags:\s*\[(.+)\]", fm_match.group(1), re.MULTILINE)
             if tg:
                 tags = tg.group(1).strip()
 
-        # Extract first sentence of body for summary (single-line, safe for table)
-        body = text[fm_match.end():].strip() if fm_match else text
+        # First sentence of the body is the summary
+        body = text[fm_match.end():] if fm_match else text
         s = re.search(r"[A-Z][^.!?\n]{10,}[.!?]", body)
         if s:
-            summary = s.group(0).replace("\n", " ").replace("|", "-")[:100]
+            summary = s.group(0)[:100]
 
-        row = f"| [[{slug}]] | {summary} | {tags} | {today} |"
+        row = f"| [[{slug}]] | {_table_cell(summary)} | {_table_cell(tags)} | {today} |"
 
         if not index_path.exists():
-            index_path.write_text(
+            write_atomic(
+                str(index_path),
                 "# Wiki Index\n\n"
                 "| Page | Summary | Tags | Updated |\n"
                 "|------|---------|------|--------|\n"
                 f"{row}\n",
-                encoding="utf-8",
             )
             return
 
         content = index_path.read_text(encoding="utf-8")
-        # Replace existing row for this slug or append
         pattern = re.compile(rf"^\| \[\[{re.escape(slug)}\]\].*$", re.MULTILINE)
         if pattern.search(content):
-            content = pattern.sub(row, content)
+            # A function, not a string: LLM text may contain backslashes
+            # that re.sub would treat as group references.
+            content = pattern.sub(lambda _m: row, content)
         else:
             content = content.rstrip() + f"\n{row}\n"
+        write_atomic(str(index_path), content)
 
-        tmp = index_path.with_suffix(".tmp")
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(index_path)
+    def _remove_index_row(self, slug: str):
+        index_path = self._wiki_dir / "index.md"
+        if not index_path.exists():
+            return
+        content = index_path.read_text(encoding="utf-8")
+        updated = re.sub(
+            rf"^\|\s*\[\[{re.escape(slug)}\]\].*\n?", "", content, flags=re.MULTILINE
+        )
+        if updated != content:
+            write_atomic(str(index_path), updated)
 
     def _append_log(self, entry: str):
         """Append an entry to wiki/log.md."""
-        log_path = self._wiki_dir / "log.md"
-        with open(log_path, "a", encoding="utf-8") as f:
+        self._wiki_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._wiki_dir / "log.md", "a", encoding="utf-8") as f:
             f.write(f"\n## {entry}\n")
+
+    def prune_removed_sources(self) -> list[str]:
+        """Remove wiki pages whose source file was deleted from knowledge/.
+
+        Only sources this wiki was built from (tracked in the hash cache) are
+        considered, and nothing is pruned while knowledge/ is empty, so a
+        wiki deployed without its raw sources is never wiped. Returns the
+        slugs removed.
+        """
+        present = {p.name for p in self._source_files()}
+        if not present:
+            return []
+        with self._lock:
+            gone = sorted(set(self._file_hashes) - present)
+        if not gone:
+            return []
+
+        today = date.today().isoformat()
+        removed: list[str] = []
+        for name in gone:
+            slug = self._slug_for(Path(name))
+            page = self._wiki_dir / f"{slug}.md"
+            if page.exists():
+                sources = self._extract_sources(
+                    page.read_text(encoding="utf-8", errors="replace")
+                )
+                if not any((self._knowledge_dir / Path(s).name).is_file() for s in sources):
+                    page.unlink()
+                    self._remove_index_row(slug)
+                    self._delete_embedding(slug)
+                    removed.append(slug)
+                    self._append_log(f"[{today}] prune | {name}\nRemoved: {slug}.md")
+                    log.info(f"source {name} deleted — removed wiki/{slug}.md")
+            with self._lock:
+                self._file_hashes.pop(name, None)
+
+        self._save_hash_cache()
+        return removed
 
     # --- Query pipeline ---
 
@@ -489,78 +567,15 @@ class WikiEngine:
         if not self._ollama_available:
             return "", False
 
-        # Step 1: BM25 keyword search on index.md
-        page_slugs = self._bm25_search(q)
-
-        # Step 2: Optional semantic search fallback
-        if not page_slugs and self._rag_available:
-            page_slugs = self._vector_search(q)
-
-        # Step 3 (fallback): search wiki page bodies directly when index misses
-        if not page_slugs:
-            page_slugs = self._content_search(q)
-
+        page_slugs = self._find_pages(q)
         if not page_slugs:
             return "", False
 
-        # Step 3: Read top pages, then follow sources: links into knowledge/
-        context_parts = []
-        for slug in page_slugs[:3]:
-            page_path = self._wiki_dir / f"{slug}.md"
-            if not page_path.exists():
-                continue
-            wiki_text = page_path.read_text(encoding="utf-8", errors="replace")
-
-            # Annotate time-sensitive pages with staleness
-            ts_files = self.cfg.get("time_sensitive_files", [])
-            age_header = ""
-            if any(f.replace(".md", "") in slug for f in ts_files):
-                age_note = self._staleness_note(page_path)
-                if age_note:
-                    age_header = f"[{slug} — {age_note}]\n"
-
-            # Follow sources: links → read raw knowledge files for full detail
-            src_files = self._extract_sources(wiki_text)
-            source_texts: list[str] = []
-            for src_file in src_files:
-                src_path = self._knowledge_dir / src_file
-                if src_path.exists():
-                    try:
-                        raw = src_path.read_text(encoding="utf-8", errors="replace")
-                        source_texts.append(f"[Source: {src_file}]\n{raw}")
-                    except Exception as exc:
-                        log.warning(f"could not read source {src_file}: {exc}")
-
-            if source_texts:
-                # Source files are the primary context; wiki index is the header
-                section = (
-                    age_header
-                    + f"[Wiki index: {slug}]\n{wiki_text}\n\n"
-                    + "\n\n".join(source_texts)
-                )
-            else:
-                # No source file available — fall back to wiki page alone
-                section = age_header + wiki_text
-
-            context_parts.append(section)
-
-        if not context_parts:
+        budget = self._context_budget_chars(history, board_context, peer_ctx)
+        context = self._build_context(q, page_slugs[:MAX_CONTEXT_PAGES], budget)
+        if not context:
             return "", False
 
-        context = "\n\n---\n\n".join(context_parts)
-
-        # Step 4: Trim context to token budget
-        max_tokens = self.cfg.get("max_context_tokens")
-        if max_tokens:
-            context = context[: max_tokens * 4]  # ~4 chars/token
-
-        if self.cfg.get("reorder_context") and context_parts:
-            # Small-model heuristic: move highest-ranked context to end
-            if len(context_parts) > 1:
-                context_parts = context_parts[1:] + [context_parts[0]]
-                context = "\n\n---\n\n".join(context_parts)
-
-        # Step 5: Assemble and generate
         answer = self._generate(q, context, peer_ctx=peer_ctx, history=history,
                                 board_context=board_context)
         # _generate returns "" when the model declines (IDK) — treat as no
@@ -569,6 +584,134 @@ class WikiEngine:
         if not answer:
             return "", False
         return answer, True
+
+    def _find_pages(self, q: str) -> list[str]:
+        """Rank wiki pages for a question: index keywords, then semantic
+        similarity, then words in the page bodies."""
+        slugs = self._bm25_search(q)
+        if not slugs and self._rag_available:
+            slugs = self._vector_search(q)
+        if not slugs:
+            slugs = self._content_search(q)
+        return slugs
+
+    def _context_tokens(self) -> int:
+        return int(self.cfg.get("max_context_tokens") or DEFAULT_CONTEXT_TOKENS)
+
+    def _num_predict(self) -> int:
+        return int(self.cfg.get("num_predict") or 300)
+
+    def num_ctx(self) -> int:
+        """Context window sent to Ollama for answers.
+
+        num_ctx from config if set; otherwise derived from the context budget
+        and fixed for the life of the process (a num_ctx that changes between
+        requests makes Ollama reload the model).
+        """
+        configured = self.cfg.get("num_ctx")
+        if configured:
+            return int(configured)
+        need = (self._context_tokens() + PROMPT_OVERHEAD_TOKENS + self._num_predict()) * 1.15
+        return max(2048, math.ceil(need / 512) * 512)
+
+    def _context_budget_chars(self, *extras: str) -> int:
+        """Chars of retrieved passages that fit alongside the other prompt parts."""
+        wanted = self._context_tokens() * CHARS_PER_TOKEN
+        window = (self.num_ctx() - self._num_predict() - 256) * CHARS_PER_TOKEN
+        available = window - sum(len(x) for x in extras if x)
+        return max(MIN_CONTEXT_CHARS, min(wanted, available))
+
+    def _build_context(self, q: str, slugs: list[str], budget: int) -> str:
+        """Assemble the most relevant passages from the pages' sources.
+
+        Each page's source files (or the page itself, if its sources are not
+        on this node) are split into section passages, ranked against the
+        question with BM25, and added best-first until *budget* chars are
+        used. Output keeps document order within each page.
+        """
+        ts_files = self.cfg.get("time_sensitive_files") or []
+        pages: list[tuple[int, str]] = []                 # (rank, header)
+        flat: list[tuple[int, str, int, str]] = []        # (rank, source, order, text)
+
+        for rank, slug in enumerate(slugs):
+            page_path = self._wiki_dir / f"{slug}.md"
+            if not page_path.exists():
+                continue
+            wiki_text = page_path.read_text(encoding="utf-8", errors="replace")
+
+            passages: list[tuple[str, int, str]] = []
+            src_paths: list[Path] = []
+            for src in self._extract_sources(wiki_text):
+                # Basename only: frontmatter is LLM-written, never a path.
+                src_path = self._knowledge_dir / Path(src).name
+                if not src_path.is_file():
+                    continue
+                try:
+                    raw = src_path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    log.warning(f"could not read source {src}: {exc}")
+                    continue
+                src_paths.append(src_path)
+                passages += [(src_path.name, i, p) for i, p in enumerate(split_passages(raw))]
+
+            if not passages:  # sources not on this node: use the wiki page itself
+                passages = [(page_path.name, i, p) for i, p in enumerate(split_passages(wiki_text))]
+            if not passages:
+                continue
+
+            header = f"[{slug}"
+            if any(Path(f).stem and Path(f).stem in slug for f in ts_files):
+                note = self._staleness_note(page_path, src_paths)
+                if note:
+                    header += f" — {note}"
+            pages.append((rank, header + "]"))
+            flat += [(rank, src, i, text) for src, i, text in passages]
+
+        if not pages:
+            return ""
+
+        q_terms = tokenize(q)
+        corpus = [(str(i), tokenize(text)) for i, (_, _, _, text) in enumerate(flat)]
+        scores = _bm25_scores(q_terms, corpus) if q_terms else [0.0] * len(flat)
+        weights = [
+            s * _RANK_WEIGHTS[min(rank, len(_RANK_WEIGHTS) - 1)]
+            for s, (rank, _, _, _) in zip(scores, flat)
+        ]
+
+        ranked = sorted((i for i, w in enumerate(weights) if w > 0), key=lambda i: -weights[i])
+        in_doc_order = not ranked
+        if in_doc_order:
+            # Found by semantic or fuzzy match with no shared keyword: read the
+            # top page from the start.
+            ranked = [i for i, (rank, _, _, _) in enumerate(flat) if rank == pages[0][0]]
+
+        chosen: list[int] = []
+        used = 0
+        for i in ranked:
+            size = len(flat[i][3]) + 2
+            if used + size > budget:
+                if in_doc_order:
+                    break
+                continue
+            chosen.append(i)
+            used += size
+        if not chosen:  # best passage alone exceeds the budget: truncate it
+            i = ranked[0]
+            flat[i] = (*flat[i][:3], flat[i][3][:budget])
+            chosen = [i]
+
+        by_rank: dict[int, list[int]] = {}
+        for i in chosen:
+            by_rank.setdefault(flat[i][0], []).append(i)
+        order = [(rank, header) for rank, header in pages if rank in by_rank]
+        if self.cfg.get("reorder_context"):
+            order.reverse()  # small models: most relevant page next to the question
+
+        parts = []
+        for rank, header in order:
+            idxs = sorted(by_rank[rank], key=lambda i: (flat[i][1], flat[i][2]))
+            parts.append(header + "\n" + "\n\n".join(flat[i][3] for i in idxs))
+        return "\n\n---\n\n".join(parts)
 
     def _generate(
         self,
@@ -598,10 +741,7 @@ class WikiEngine:
 
         prompt = "\n\n".join(parts)
 
-        options: dict = {"num_predict": self.cfg.get("num_predict", 300)}
-        num_ctx = self.cfg.get("num_ctx")
-        if num_ctx:
-            options["num_ctx"] = num_ctx
+        options = {"num_predict": self._num_predict(), "num_ctx": self.num_ctx()}
 
         try:
             response = self._ollama.generate(
@@ -620,18 +760,26 @@ class WikiEngine:
             raise LLMError(kind, str(e)) from e
 
         # If the LLM refused to answer from context, return "" so the caller
-        # falls through to suggest() rather than caching a useless response.
+        # falls through rather than caching a useless response.
         if self._is_idk_response(text):
-            log.info("LLM returned IDK response — falling through to suggest()")
+            log.info("LLM returned IDK response — falling through")
             return ""
         return text
 
     def _is_idk_response(self, text: str) -> bool:
-        """Return True when the LLM response is a bare refusal."""
-        if not text or len(text) > 180:
-            return not text  # long responses are probably useful
-        lower = text.lower()
-        return any(p in lower for p in _IDK_PATTERNS)
+        """True when the response is a bare refusal ("I don't know.").
+
+        Only the first sentence is checked, so an answer that merely hedges
+        later ("The trail is 3 mi. I'm not sure about ice.") is kept.
+        """
+        if not text:
+            return True
+        if len(text) > 180:
+            return False  # long responses are probably useful
+        first = _FIRST_SENTENCE_END.split(text.strip(), maxsplit=1)[0].lower()
+        if " but " in first:
+            return False  # "I'm not sure, but the log shows…" is an answer
+        return any(p in first for p in _IDK_PATTERNS)
 
     def suggest(self, query: str) -> str:
         """Return a soft suggestion when no wiki page matches well."""
@@ -645,7 +793,7 @@ class WikiEngine:
             f"I know about: {topic_str}. Try !topics for full list."
         )
 
-    # --- BM25 search ---
+    # --- Keyword search ---
 
     def _bm25_search(self, query: str) -> list[str]:
         """BM25 keyword search on wiki/index.md. Returns ranked slug list."""
@@ -654,7 +802,7 @@ class WikiEngine:
             return []
 
         content = index_path.read_text(encoding="utf-8", errors="replace")
-        query_terms = _tokenize(query)
+        query_terms = tokenize(query)
         if not query_terms:
             return []
 
@@ -664,25 +812,21 @@ class WikiEngine:
             content,
             re.MULTILINE,
         )
-
         if not rows:
             return []
 
         # Build corpus: one document per row (slug + summary + tags)
-        corpus: list[tuple[str, list[str]]] = []
-        for slug, summary, tags in rows:
-            doc_text = f"{slug} {summary} {tags}"
-            corpus.append((slug.strip(), _tokenize(doc_text)))
-
+        corpus = [
+            (slug.strip(), tokenize(f"{slug} {summary} {tags}"))
+            for slug, summary, tags in rows
+        ]
         scores = _bm25_scores(query_terms, corpus)
         ranked = sorted(zip(scores, [slug for slug, _ in corpus]), reverse=True)
-
-        threshold = 0.0
-        return [slug for score, slug in ranked if score > threshold]
+        return [slug for score, slug in ranked if score > 0.0]
 
     def _extract_sources(self, wiki_text: str) -> list[str]:
         """Parse the sources: [...] list from a wiki page's YAML frontmatter."""
-        fm_match = re.match(r"^---\n(.*?)\n---", wiki_text, re.DOTALL)
+        fm_match = _FRONTMATTER.match(wiki_text)
         if not fm_match:
             return []
         src_m = re.search(r"^sources:\s*\[(.+)\]", fm_match.group(1), re.MULTILINE)
@@ -695,12 +839,9 @@ class WikiEngine:
         ]
 
     def _content_search(self, query: str) -> list[str]:
-        """Last-resort fallback: score wiki page bodies by raw term frequency.
-
-        Used when BM25 index search and vector search both return nothing.
-        Returns pages ranked by how many query terms appear in the full body.
-        """
-        query_terms = _tokenize(query)
+        """Last-resort fallback: rank wiki page bodies by how often the
+        question's words occur in them (whole words, not substrings)."""
+        query_terms = set(tokenize(query))
         if not query_terms:
             return []
 
@@ -709,12 +850,12 @@ class WikiEngine:
             if page_path.name in ("index.md", "log.md"):
                 continue
             try:
-                body = page_path.read_text(encoding="utf-8", errors="replace").lower()
-                score = sum(body.count(term) for term in query_terms)
-                if score > 0:
-                    scored.append((score, page_path.stem))
-            except Exception:
+                counts = Counter(tokenize(page_path.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
                 continue
+            score = sum(counts[t] for t in query_terms)
+            if score > 0:
+                scored.append((score, page_path.stem))
 
         scored.sort(reverse=True)
         return [slug for _, slug in scored]
@@ -764,15 +905,19 @@ class WikiEngine:
             log.warning(f"embedding failed: {e}")
             return None
 
-    def _embed_wiki_pages(self):
-        """Embed all wiki pages into ChromaDB for semantic search."""
+    def _embed_wiki_pages(self, slugs: list[str] | None = None):
+        """Embed wiki pages into ChromaDB (all pages, or just *slugs*)."""
         if not self._rag_available or not self._ollama_available:
             return
 
-        pages = [
-            f for f in self._wiki_dir.glob("*.md")
-            if f.name not in ("index.md", "log.md")
-        ]
+        if slugs is None:
+            pages = [
+                f for f in self._wiki_dir.glob("*.md")
+                if f.name not in ("index.md", "log.md")
+            ]
+        else:
+            pages = [self._wiki_dir / f"{s}.md" for s in slugs]
+        pages = [p for p in pages if p.exists()]
         if not pages:
             return
 
@@ -794,6 +939,14 @@ class WikiEngine:
                 log.warning(f"embedding failed for {page_path.name}: {e}")
 
         log.info("wiki embedding complete")
+
+    def _delete_embedding(self, slug: str):
+        if not self._rag_available:
+            return
+        try:
+            self._collection.delete(ids=[slug])
+        except Exception as e:
+            log.warning(f"could not delete embedding for {slug}: {e}")
 
     # --- Lint ---
 
@@ -824,21 +977,9 @@ class WikiEngine:
 
         index_content = index_path.read_text(encoding="utf-8", errors="replace")
 
-        # Extract page slugs only from the first column of index table rows.
-        # Pattern: start-of-line | optional-spaces [[slug]]
-        #
-        # Using re.findall(r"\[\[...\]\]", full_text) is unreliable because a
-        # malformed unclosed [[ref in a summary column causes [^\]]+ to greedily
-        # swallow newlines and consume the [[slug]] on the following row.
-        # Anchoring to "^ | [[slug]]" makes the extraction independent of what
-        # appears in later columns.
-        indexed_slugs: set[str] = set(
-            re.findall(
-                r"^\|\s*\[\[([a-z0-9][a-z0-9-]*)\]\]",
-                index_content,
-                re.MULTILINE,
-            )
-        )
+        # Page slugs come only from the first column of index table rows: an
+        # unclosed [[ref in a summary cell could otherwise swallow the next row.
+        indexed_slugs: set[str] = set(_index_slugs(index_content))
 
         pages = {
             f.stem
@@ -874,6 +1015,15 @@ class WikiEngine:
                 except ValueError:
                     pass
 
+        # Missing sources: only meaningful when this node has its knowledge/
+        # folder (a wiki can legitimately be deployed without raw sources).
+        if self._source_files():
+            for slug in sorted(pages):
+                text = (self._wiki_dir / f"{slug}.md").read_text(encoding="utf-8", errors="replace")
+                for src in self._extract_sources(text):
+                    if not (self._knowledge_dir / Path(src).name).is_file():
+                        issues.append(f"missing source: {slug}.md lists {src}, not in knowledge/")
+
         # Missing cross-refs: [[slug]] in a page body that looks like a page link
         # but has no corresponding wiki file.  Skip inline mentions (dates, proper
         # nouns, URLs) — only check refs that are valid kebab-case page slugs.
@@ -894,7 +1044,8 @@ class WikiEngine:
             f"Issues: {len(issues)} total. "
             f"{sum(1 for i in issues if 'orphan' in i)} orphan, "
             f"{sum(1 for i in issues if 'stale' in i)} stale, "
-            f"{sum(1 for i in issues if 'cross-ref' in i)} missing cross-refs."
+            f"{sum(1 for i in issues if 'cross-ref' in i)} missing cross-refs, "
+            f"{sum(1 for i in issues if 'missing source' in i)} missing sources."
         )
 
         return issues
@@ -902,67 +1053,73 @@ class WikiEngine:
     # --- Watch ---
 
     def watch(self, interval: int, stop: threading.Event):
-        """Background watcher: re-build when knowledge/ files change."""
+        """Background watcher: rebuild pages when knowledge/ files change and
+        drop pages whose source was deleted.
+
+        Uses wiki_patch_model, or the serving model — never the (possibly
+        much larger) wiki_builder_model, which may not fit on the node.
+        Disabled by wiki_watch_enabled: false.
+        """
+        if not self.cfg.get("wiki_watch_enabled", True):
+            log.info("wiki watcher disabled (wiki_watch_enabled: false)")
+            return
+        model = self.cfg.get("wiki_patch_model") or self.cfg["model"]
+
         def _watcher():
             while not stop.is_set():
                 try:
+                    self.prune_removed_sources()
                     changed = self._detect_changes()
-                    if changed:
+                    if changed and self._ollama_available:
                         log.info(f"knowledge change detected ({len(changed)} file(s))")
                         for f in changed:
-                            self.build(file=f)
-                except Exception as e:
-                    log.error(f"wiki watcher error: {e}")
+                            self.build(file=f, model=model)
+                except Exception:
+                    log.exception("wiki watcher error")
                 stop.wait(interval)
 
-        threading.Thread(target=_watcher, daemon=True).start()
-        log.info(f"wiki watcher started (poll every {interval}s)")
+        threading.Thread(target=_watcher, name="wiki-watcher", daemon=True).start()
+        log.info(f"wiki watcher started (poll every {interval}s, model {model!r})")
 
     def _detect_changes(self) -> list[str]:
-        """Return list of knowledge file paths that have changed since last build."""
+        """Return knowledge file paths whose content changed since last build."""
         changed = []
-        for ext in ("*.md", "*.txt"):
-            for path in self._knowledge_dir.glob(ext):
-                try:
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                    h = hashlib.md5(content.encode()).hexdigest()
-                    with self._lock:
-                        if self._file_hashes.get(str(path)) != h:
-                            changed.append(str(path))
-                except Exception:
-                    pass
+        for path in self._source_files():
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            h = hashlib.md5(content.encode()).hexdigest()
+            with self._lock:
+                if self._file_hashes.get(path.name) != h:
+                    changed.append(str(path))
         return changed
 
     # --- Topics ---
 
     def get_topics(self) -> list[str]:
-        """Return list of wiki page titles from index.md."""
+        """Return readable page titles from index.md, in index order."""
         index_path = self._wiki_dir / "index.md"
         if not index_path.exists():
             return []
         content = index_path.read_text(encoding="utf-8", errors="replace")
-        # Extract slugs; convert to readable titles
-        slugs = re.findall(r"\[\[([^\]]+)\]\]", content)
-        return [s.replace("-", " ").title() for s in slugs]
+        return [s.replace("-", " ").title() for s in _index_slugs(content)]
 
     # --- Staleness annotation ---
 
-    def _staleness_note(self, page_path: Path) -> str:
-        """Return a staleness annotation for time-sensitive pages."""
+    def _staleness_note(self, page_path: Path, sources: list[Path]) -> str:
+        """How old a time-sensitive page's data is: the newest source file's
+        modification time, or the page's last_ingested date."""
         try:
+            if sources:
+                age = time.time() - max(p.stat().st_mtime for p in sources)
+                return f"last updated {_age_phrase(age)}"
             text = page_path.read_text(encoding="utf-8", errors="replace")
-            m = re.search(r"^last_ingested:\s*(.+)$", text, re.MULTILINE)
+            m = re.search(r"^last_ingested:\s*(\S+)", text, re.MULTILINE)
             if m:
-                ingested = datetime.fromisoformat(m.group(1).strip())
-                now = datetime.now()
-                delta = now - ingested
-                hours = int(delta.total_seconds() / 3600)
-                if hours < 1:
-                    return "last updated < 1 hr ago"
-                if hours < 24:
-                    return f"last updated {hours} hrs ago"
-                return f"last updated {delta.days}d ago"
-        except Exception:
+                days = (date.today() - date.fromisoformat(m.group(1))).days
+                return "ingested today" if days <= 0 else f"ingested {days}d ago"
+        except (OSError, ValueError):
             pass
         return ""
 
@@ -972,30 +1129,162 @@ class WikiEngine:
         try:
             if self._hash_cache_file.exists():
                 with open(self._hash_cache_file) as f:
-                    with self._lock:
-                        self._file_hashes = json.load(f)
-        except Exception:
-            pass
+                    data = json.load(f)
+                # v0.2 keyed hashes by absolute path, so a wiki built on one
+                # machine looked entirely changed on another. Key by filename.
+                with self._lock:
+                    self._file_hashes = {Path(k).name: v for k, v in data.items()}
+        except Exception as e:
+            log.warning(f"could not load wiki hash cache: {e}")
 
     def _save_hash_cache(self):
-        try:
-            self._wiki_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self._hash_cache_file.with_suffix(".tmp")
-            with self._lock:
-                data = dict(self._file_hashes)
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            tmp.replace(self._hash_cache_file)
-        except Exception as e:
-            log.warning(f"could not save hash cache: {e}")
+        with self._lock:
+            data = dict(self._file_hashes)
+        write_atomic(str(self._hash_cache_file), json.dumps(data, sort_keys=True))
 
 
-# --- BM25 helpers ---
+# --- Helpers ---
 
-def _tokenize(text: str) -> list[str]:
-    """Lowercase, remove punctuation, filter stop words."""
-    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
-    return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
+
+def split_passages(text: str, max_chars: int = PASSAGE_CHARS) -> list[str]:
+    """Split a markdown or plain-text document into passages of about
+    max_chars.
+
+    Sections start at markdown headings, and a passage never spans two
+    sections. The section heading is repeated at the top of every passage
+    cut from it, so each passage makes sense on its own.
+    """
+    body = _FRONTMATTER.sub("", text.replace("\r\n", "\n"), count=1)
+    sections: list[tuple[str, list[str]]] = []
+    heading, paragraphs, lines = "", [], []
+
+    for raw in body.split("\n"):
+        line = raw.rstrip()
+        if _HEADING.match(line):
+            if lines:
+                paragraphs.append("\n".join(lines))
+                lines = []
+            sections.append((heading, paragraphs))
+            heading, paragraphs = line.strip(), []
+        elif not line.strip():
+            if lines:
+                paragraphs.append("\n".join(lines))
+                lines = []
+        else:
+            lines.append(line)
+    if lines:
+        paragraphs.append("\n".join(lines))
+    sections.append((heading, paragraphs))
+
+    passages: list[str] = []
+    for heading, paras in sections:
+        if not paras:
+            continue
+        budget = max(max_chars - len(heading) - 1, max_chars // 2)
+        current = ""
+        for piece in _fit_pieces(paras, budget):
+            candidate = f"{current}\n\n{piece}" if current else piece
+            if len(candidate) <= budget:
+                current = candidate
+            else:
+                passages.append(f"{heading}\n{current}" if heading else current)
+                current = piece
+        if current:
+            passages.append(f"{heading}\n{current}" if heading else current)
+    return passages
+
+
+def _fit_pieces(paragraphs: list[str], budget: int):
+    """Yield paragraphs, splitting any longer than budget by line, then by
+    sentence or word."""
+    for para in paragraphs:
+        if len(para) <= budget:
+            yield para
+            continue
+        current = ""
+        for line in para.split("\n"):
+            for piece in _split_long_line(line, budget):
+                candidate = f"{current}\n{piece}" if current else piece
+                if len(candidate) <= budget:
+                    current = candidate
+                else:
+                    if current:
+                        yield current
+                    current = piece
+        if current:
+            yield current
+
+
+def _split_long_line(line: str, budget: int) -> list[str]:
+    out: list[str] = []
+    rest = line.strip()
+    while len(rest) > budget:
+        cut = max(rest.rfind(". ", 0, budget), rest.rfind("; ", 0, budget))
+        if cut < budget // 3:
+            cut = rest.rfind(" ", 0, budget)
+        if cut <= 0:
+            cut = budget - 1
+        out.append(rest[: cut + 1].strip())
+        rest = rest[cut + 1:].strip()
+    if rest:
+        out.append(rest)
+    return out
+
+
+def _index_slugs(index_content: str) -> list[str]:
+    """Page slugs from the first column of wiki/index.md rows, in order."""
+    seen: dict[str, None] = {}
+    for slug in re.findall(r"^\|\s*\[\[([\w-]+)\]\]", index_content, re.MULTILINE):
+        seen.setdefault(slug, None)
+    return list(seen)
+
+
+def _table_cell(text: str) -> str:
+    """Make text safe for one markdown table cell."""
+    return " ".join(text.split()).replace("|", "/")
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove a ```markdown ... ``` wrapper small models sometimes add."""
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return text
+
+
+def _normalise_frontmatter(wiki_text: str, source: Path, today: str) -> str:
+    """Make sure a generated page names its real source file and build date.
+
+    Query-time source lookup and pruning rely on sources:, so it is set to
+    the actual filename whatever the model wrote.
+    """
+    sources_line = f"sources: [{source.name}]"
+    ingested_line = f"last_ingested: {today}"
+    fm = _FRONTMATTER.match(wiki_text)
+    if not fm:
+        title = source.stem.replace("-", " ").replace("_", " ").title()
+        return (
+            f"---\ntitle: {title}\ntags: []\n{sources_line}\n{ingested_line}\n---\n\n"
+            + wiki_text.strip() + "\n"
+        )
+    lines = [
+        ln for ln in fm.group(1).split("\n")
+        if not ln.startswith(("sources:", "last_ingested:"))
+    ]
+    lines += [sources_line, ingested_line]
+    return "---\n" + "\n".join(lines) + "\n---\n" + wiki_text[fm.end():]
+
+
+def _age_phrase(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    if hours < 1:
+        return "< 1 hr ago"
+    if hours < 24:
+        return f"{hours} hrs ago"
+    return f"{hours // 24}d ago"
 
 
 def _bm25_scores(
@@ -1009,18 +1298,19 @@ def _bm25_scores(
     if n == 0:
         return []
 
-    avg_dl = sum(len(doc) for _, doc in corpus) / n
-    scores = []
+    avg_dl = (sum(len(doc) for _, doc in corpus) / n) or 1.0
+    counts = [Counter(doc) for _, doc in corpus]
+    df = {t: sum(1 for c in counts if t in c) for t in set(query_terms)}
 
-    for _, doc_tokens in corpus:
-        dl = len(doc_tokens)
+    scores = []
+    for (_, doc), tf_counts in zip(corpus, counts):
+        dl = len(doc)
         score = 0.0
         for term in query_terms:
-            tf = doc_tokens.count(term)
+            tf = tf_counts.get(term, 0)
             if tf == 0:
                 continue
-            df = sum(1 for _, d in corpus if term in d)
-            idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
+            idf = math.log((n - df[term] + 0.5) / (df[term] + 0.5) + 1)
             tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
             score += idf * tf_norm
         scores.append(score)

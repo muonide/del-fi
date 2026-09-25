@@ -25,8 +25,7 @@ DEFAULTS: dict = {
     "wiki_stale_after_days": 30,
     "wiki_watch_enabled": True,
     "wiki_watch_interval_seconds": 60,
-    "wiki_patch_model": "",
-    "wiki_patch_threshold_pct": 40,
+    "wiki_patch_model": "",              # watcher rebuilds; falls back to model
     "time_sensitive_files": ["weather-station.md", "trail-camera-log.md"],
     # --- Retrieval ---
     "max_response_bytes": 230,
@@ -100,6 +99,7 @@ ORACLE_PROFILES: dict[str, dict] = {
     "gemma4:12b": {
         "similarity_threshold": 0.25,
         "rag_top_k": 5,
+        "max_context_tokens": 3000,
     },
     "gemma3:1b": {
         "similarity_threshold": 0.35,
