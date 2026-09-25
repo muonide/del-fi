@@ -35,3 +35,16 @@ jobs:
           python-version: "3.12"
       - run: pip install pyyaml
       - run: python -m unittest discover -s tests -t .
+
+  requirements:
+    name: unittest (requirements.txt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Everything operators install, so a dependency release that breaks
+      # Del-Fi fails here (this job also runs the real-ChromaDB test).
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -t .

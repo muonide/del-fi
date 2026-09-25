@@ -1,6 +1,6 @@
-meshtastic>=2.3.0
-ollama>=0.2.0
-chromadb>=0.5.0
-pyyaml>=6.0
-flask>=3.0.0         # required for --gui
+meshtastic>=2.7.11
+ollama>=0.6.2
+chromadb>=1.5.9      # optional: semantic search
+pyyaml>=6.0.3
+flask>=3.1.3         # optional: the --gui control panel
 # pymupdf>=1.24.0  # PDF support — deferred, optional

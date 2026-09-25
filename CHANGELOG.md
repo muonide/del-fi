@@ -104,6 +104,11 @@ review of v0.2 is fixed with a regression test.
   `e4b`, `12b`, `26b` and `31b`). If your `config.yaml` names `gemma4:4b` or
   `gemma4:2b`, change it to `gemma4:e4b` or `gemma4:e2b`; the model profiles
   now match those tags.
+- **Dependencies:** `requirements.txt` asks for the current releases
+  (ollama 0.6.2, meshtastic 2.7.11, chromadb 1.5.9, Flask 3.1.3,
+  PyYAML 6.0.3). Update with `pip install -U -r requirements.txt`. Embeddings
+  now use Ollama's `embed` call (the old `embeddings` call is deprecated);
+  pages you already embedded keep working.
 - **Peering config:** move `trusted_peers`, `peer_cache_ttl`,
   `max_cache_entries` and `gossip_announce_interval` into the
   `mesh_knowledge` block (see `config.example.yaml`). The old keys still work

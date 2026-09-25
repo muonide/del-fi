@@ -896,11 +896,14 @@ class WikiEngine:
 
     def _embed_text(self, text: str) -> list[float] | None:
         try:
-            resp = self._ollama.embeddings(
+            # /api/embed; the older embeddings() call is deprecated. Its
+            # vectors are normalised, which cosine similarity ignores, so
+            # pages embedded with the old call still compare correctly.
+            resp = self._ollama.embed(
                 model=self.cfg["embedding_model"],
-                prompt=text,
+                input=text,
             )
-            return resp.embedding
+            return list(resp.embeddings[0]) if resp.embeddings else None
         except Exception as e:
             log.warning(f"embedding failed: {e}")
             return None
