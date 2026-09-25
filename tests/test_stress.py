@@ -87,6 +87,7 @@ def _mock_wiki(available=True, generate_delay=0.0, generate_text="Test answer.")
         def store(self, *a, **kw): pass
 
     class _MockGossipDir:
+        enabled = True
         peer_count = 0
         def list_peers(self): return []
         def receive(self, nid, txt): pass

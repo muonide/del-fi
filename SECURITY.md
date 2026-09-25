@@ -42,11 +42,18 @@ production web service. The deployment model assumes:
 - **The LLM is local.** There is no remote API key to steal. Ollama runs
   entirely on the operator's hardware.
 - **Peer nodes are semi-trusted.** Peer-cached answers are labelled with the
-  source node. Only nodes in the `trusted_peers` config list can contribute
-  to the Tier 2 cache.
-- **The board is untrusted.** Board posts are sandboxed in the LLM prompt and
-  filtered for injection patterns. The board should not be the only defence
-  for a high-stakes deployment.
+  source node. Only hardware node IDs listed in `mesh_knowledge.peers` can
+  contribute to the Tier 2 cache; display names never grant trust.
+- **Gossip is untrusted metadata.** Announcements (opt-in) only produce
+  referrals ("Try NODE (!id) — covers …"), never answers. They are
+  sanitised, keyed by sender node ID, and the directory is size-capped.
+- **The board is untrusted.** Only posts relevant to a question reach the
+  LLM prompt, flattened to one line each, inside markers with a random
+  per-prompt nonce so a post cannot close the untrusted block; posts are
+  also filtered for common injection phrasings. The board should not be
+  the only defence for a high-stakes deployment.
+- **The GUI is local-only.** It binds to 127.0.0.1 and rejects cross-site
+  requests; reach a headless node's GUI through an SSH tunnel.
 
 ## Out of scope
 

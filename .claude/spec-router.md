@@ -328,48 +328,52 @@ known topics (`wiki.suggest()`); otherwise
 
 ## 7. Gossip Announcement Protocol
 
+Opt-in: `mesh_knowledge.gossip.enabled: true` turns on both announcing and
+listening. When off, announcements are ignored, `!peers` says gossip is
+off, and Tier 3 referrals never fire.
+
 ### 7.1 Announcement format
 
 ```
-DEL-FI:{version}:ANNOUNCE:{NODE_NAME}:topics={t1},{t2}:model={model}:uptime={Xd}:docs={N}
+DEL-FI:1:ANNOUNCE:{NODE_NAME}:topics={t1},{t2}:model={model}
 ```
 
-- `version`: protocol integer (currently `1`)
-- `NODE_NAME`: `ALL-CAPS-HYPHENATED` node name
-- `topics`: comma-separated list of wiki page titles (or knowledge folder names)
-- `uptime`: human-readable days
-- `docs`: integer count of knowledge files
+- `NODE_NAME`: `A-Z0-9-`, max 32 chars
+- `topics`: wiki page slugs from this node's `wiki/index.md` (first column
+  only), as many as fit in one message (`max_response_bytes`)
+- `model`: always last; runs to the end of the message because model names
+  contain colons (`llama3.2:3b`)
 
-Announcement is broadcast (not DM) at `gossip_interval_seconds` (default: 14400 = 4h).
-Announcements are short: must fit in 230 bytes.
+Broadcast on `gossip.channel` (default 0) every `gossip.announce_interval`
+(default 4 h, minimum 15 min) ± 10%, the first one 1–5 minutes after
+startup so nodes rebooting together after a power cut don't transmit at
+once. A node with no wiki topics does not announce. Announcements arrive
+as broadcasts (the Meshtastic adapter forwards `DEL-FI:` broadcasts) or
+DMs; both are handled inline, without rate limiting or a reply.
 
-### 7.2 Gossip directory TTL
+### 7.2 Directory
 
-Received announcements expire after `gossip_ttl_seconds` (default: 86400 = 24h).
-Expired entries are pruned on each receive and on each `!peers` query.
+- Keyed by the **sender's node ID**, not the announced name, so a second
+  node claiming a name cannot overwrite the first.
+- Announcements are unauthenticated: names, topics (max 12, `a-z0-9-`,
+  max 32 chars each) and model are sanitised; the directory holds at most
+  64 nodes (oldest evicted).
+- Entries expire after `gossip.directory_ttl` (default 24 h).
+- Saved to `gossip/node-directory.json` only when an entry is new or
+  changed, or its last-seen time is over an hour stale — not on every
+  announcement (SD card wear).
 
-### 7.3 Topic matching for referrals
+### 7.3 Referrals (Tier 3)
 
-```python
-def referral(self, query: str) -> str | None:
-    """
-    Find a peer node whose topics overlap with query keywords.
-    Returns referral string or None.
-    """
-    query_words = set(query.lower().split()) - STOP_WORDS
-    best_node = None
-    best_score = 0
-    for node, entry in self._directory.items():
-        topic_words = set(" ".join(entry["topics"]).lower().split())
-        score = len(query_words & topic_words)
-        if score > best_score:
-            best_score = score
-            best_node = node
-    if best_node and best_score > 0:
-        topics = ", ".join(self._directory[best_node]["topics"][:3])
-        return f"Try {best_node} — covers {topics}"
-    return None
+The node sharing the most question words with its topics wins; generic
+topic words (`guide`, `log`, `notes`, `overview`, `area`, …) don't count.
+
 ```
+Try VALLEY-ORACLE (!a1b2c3d4) — covers geology, mining, local-history
+```
+
+The node ID is included so the user can DM the right node even if another
+node uses the same display name.
 
 ---
 

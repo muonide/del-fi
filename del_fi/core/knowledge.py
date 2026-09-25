@@ -979,7 +979,7 @@ class WikiEngine:
 
         # Page slugs come only from the first column of index table rows: an
         # unclosed [[ref in a summary cell could otherwise swallow the next row.
-        indexed_slugs: set[str] = set(_index_slugs(index_content))
+        indexed_slugs: set[str] = set(index_slugs(index_content))
 
         pages = {
             f.stem
@@ -1103,7 +1103,7 @@ class WikiEngine:
         if not index_path.exists():
             return []
         content = index_path.read_text(encoding="utf-8", errors="replace")
-        return [s.replace("-", " ").title() for s in _index_slugs(content)]
+        return [s.replace("-", " ").title() for s in index_slugs(content)]
 
     # --- Staleness annotation ---
 
@@ -1231,7 +1231,7 @@ def _split_long_line(line: str, budget: int) -> list[str]:
     return out
 
 
-def _index_slugs(index_content: str) -> list[str]:
+def index_slugs(index_content: str) -> list[str]:
     """Page slugs from the first column of wiki/index.md rows, in order."""
     seen: dict[str, None] = {}
     for slug in re.findall(r"^\|\s*\[\[([\w-]+)\]\]", index_content, re.MULTILINE):

@@ -221,6 +221,19 @@ def run_daemon(cfg: dict, simulator: bool):
     # Background: sensor feed watcher
     fact_store.watch(stop_event)
 
+    # Background: gossip announcements (opt-in: mesh_knowledge.gossip.enabled)
+    if gossip_dir.enabled:
+        threading.Thread(
+            target=gossip_dir.announce_loop,
+            args=(mesh_iface.send_broadcast, stop_event),
+            name="gossip-announcer",
+            daemon=True,
+        ).start()
+        log.info(
+            f"gossip on: announcing every {int(gossip_dir.announce_interval)}s "
+            f"on channel {gossip_dir.channel}"
+        )
+
     # Signal handling: stop the loops; cleanup runs below, on the main thread.
     def shutdown(sig, frame):
         log.info("shutting down...")

@@ -350,13 +350,15 @@ class Router:
         return "Memory cleared. I won't remember our previous conversation."
 
     def _cmd_peers(self, sender_id: str, arg: str) -> str:
+        if not self.gossip_dir.enabled:
+            return "Gossip is off on this node, so it doesn't track other Del-Fi nodes."
         peers = self.gossip_dir.list_peers()
         if not peers:
             return "No other Del-Fi nodes seen yet."
         lines = []
         for p in peers:
             topics = ", ".join(p.get("topics", [])[:4])
-            lines.append(f"{p['node_name']}: {topics}")
+            lines.append(f"{p['node_name']} ({p.get('node_id', '?')}): {topics}")
         return "\n".join(lines)
 
     def _cmd_data(self, sender_id: str, arg: str) -> str:

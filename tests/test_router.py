@@ -1,7 +1,6 @@
 """Tests for router.py — command parsing, !more cursor, edge cases."""
 
 import os
-import sys
 import time
 import tempfile
 import unittest
@@ -107,6 +106,8 @@ class MockPeerCache:
 
 class MockGossipDir:
     """Minimal mock for GossipDirectory."""
+    enabled = True
+
     @property
     def peer_count(self):
         return 0

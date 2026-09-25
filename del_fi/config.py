@@ -7,6 +7,7 @@ where crashing is correct.
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -136,12 +137,13 @@ SUPPORTED_PROTOCOLS = ("meshtastic", "meshcore")
 
 MESH_DEFAULTS: dict = {
     "gossip": {
-        "enabled": False,
-        "announce_interval": 14400,
-        "directory_ttl": 86400,
+        "enabled": False,            # announce + listen for DEL-FI: announcements
+        "announce_interval": 14400,  # seconds between broadcasts (min 900)
+        "directory_ttl": 86400,      # forget nodes not heard from for this long
+        "channel": 0,                # channel index for announcements
     },
-    "peers": [],
-    "sync": {
+    "peers": [],                     # [{node_id: "!a1b2c3d4", name: "..."}]
+    "sync": {                        # Tier 2 Q&A sync: reserved, not implemented yet
         "enabled": False,
         "window_start": "02:00",
         "window_end": "05:00",
@@ -152,6 +154,11 @@ MESH_DEFAULTS: dict = {
     "tag_responses": True,
     "reject_contradictions": True,
 }
+
+MIN_ANNOUNCE_INTERVAL = 900
+_NODE_ID = re.compile(r"^![0-9a-fA-F]{8}$")
+_DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def _match_profile(model: str) -> dict | None:
@@ -236,27 +243,109 @@ def load_config(config_path: str | None = None) -> dict:
             **(mc_raw if isinstance(mc_raw, dict) else {}),
         }
 
-    # Mesh knowledge
-    if "mesh_knowledge" in raw and raw["mesh_knowledge"]:
-        mk = raw["mesh_knowledge"]
-        if not isinstance(mk, dict):
-            log.warning(
-                f"mesh_knowledge must be a dict, got {type(mk).__name__!r} — ignoring"
-            )
-            cfg["mesh_knowledge"] = None
-        else:
-            merged: dict = {}
-            for key, default_val in MESH_DEFAULTS.items():
-                if isinstance(default_val, dict) and key in mk and isinstance(mk[key], dict):
-                    merged[key] = {**default_val, **mk[key]}
-                else:
-                    merged[key] = mk.get(key, default_val)
-            cfg["mesh_knowledge"] = merged
-    else:
-        cfg["mesh_knowledge"] = None
+    cfg["mesh_knowledge"] = _merge_mesh_knowledge(raw)
 
     _validate(cfg)
     return cfg
+
+
+def parse_duration(value) -> float | None:
+    """'30s', '15m', '12h', '7d' or a number of seconds -> seconds (None if invalid)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+    m = _DURATION.match(str(value))
+    if not m:
+        return None
+    return float(m.group(1)) * _DURATION_UNITS[m.group(2)]
+
+
+def _merge_mesh_knowledge(raw: dict) -> dict:
+    """The mesh_knowledge block with defaults filled in.
+
+    v0.2's config.example.yaml used top-level keys instead (trusted_peers,
+    peer_cache_ttl, max_cache_entries, gossip_announce_interval); those are
+    mapped in with a warning.
+    """
+    mk = raw.get("mesh_knowledge") or {}
+    if not isinstance(mk, dict):
+        log.warning(f"mesh_knowledge must be a mapping, got {type(mk).__name__!r} — ignoring")
+        mk = {}
+
+    merged: dict = {}
+    for key, default_val in MESH_DEFAULTS.items():
+        if isinstance(default_val, dict):
+            given = mk.get(key)
+            merged[key] = {**default_val, **(given if isinstance(given, dict) else {})}
+        else:
+            merged[key] = mk.get(key, default_val)
+
+    legacy = {
+        "gossip_announce_interval": ("gossip", "announce_interval"),
+        "peer_cache_ttl": ("sync", "max_cache_age"),
+        "max_cache_entries": ("sync", "max_cache_entries"),
+    }
+    for old_key, (section, new_key) in legacy.items():
+        if old_key in raw:
+            log.warning(f"config: '{old_key}' is deprecated — use mesh_knowledge.{section}.{new_key}")
+            merged[section][new_key] = raw[old_key]
+
+    if "trusted_peers" in raw:
+        log.warning(
+            "config: 'trusted_peers' is deprecated — use mesh_knowledge.peers "
+            "with hardware node IDs (display names are not authenticated)"
+        )
+        for entry in raw.get("trusted_peers") or []:
+            entry = str(entry).strip()
+            if _NODE_ID.match(entry):
+                merged["peers"].append({"node_id": entry})
+            else:
+                log.warning(f"config: ignoring trusted peer {entry!r} — not a node ID like !a1b2c3d4")
+    return merged
+
+
+def _validate_mesh_knowledge(mk: dict) -> None:
+    gossip = mk["gossip"]
+    if not isinstance(gossip.get("enabled"), bool):
+        _die("mesh_knowledge.gossip.enabled must be true or false")
+    interval = parse_duration(gossip.get("announce_interval"))
+    if interval is None or interval < MIN_ANNOUNCE_INTERVAL:
+        _die(
+            f"mesh_knowledge.gossip.announce_interval must be at least "
+            f"{MIN_ANNOUNCE_INTERVAL} seconds (got {gossip.get('announce_interval')!r}).\n"
+            "  Announcements share airtime with everyone on the channel."
+        )
+    gossip["announce_interval"] = interval
+    ttl = parse_duration(gossip.get("directory_ttl"))
+    if ttl is None or ttl <= 0:
+        _die(f"mesh_knowledge.gossip.directory_ttl must be a positive duration "
+             f"(got {gossip.get('directory_ttl')!r})")
+    gossip["directory_ttl"] = ttl
+    channel = gossip.get("channel")
+    if not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel <= 7:
+        _die(f"mesh_knowledge.gossip.channel must be a channel index 0–7 (got {channel!r})")
+
+    peers = mk.get("peers")
+    if not isinstance(peers, list):
+        _die("mesh_knowledge.peers must be a list of {node_id, name} entries")
+    for peer in peers:
+        node_id = peer.get("node_id") if isinstance(peer, dict) else None
+        if not isinstance(node_id, str) or not _NODE_ID.match(node_id):
+            _die(
+                f"mesh_knowledge.peers entry {peer!r} needs a node_id like \"!a1b2c3d4\"\n"
+                "  Peering is by hardware node ID; display names are not authenticated."
+            )
+
+    sync = mk["sync"]
+    age = parse_duration(sync.get("max_cache_age"))
+    if age is None or age <= 0:
+        _die(f"mesh_knowledge.sync.max_cache_age must be a positive duration like 7d "
+             f"(got {sync.get('max_cache_age')!r})")
+    sync["max_cache_age"] = age
+    entries = sync.get("max_cache_entries")
+    if not isinstance(entries, int) or isinstance(entries, bool) or entries < 1:
+        _die(f"mesh_knowledge.sync.max_cache_entries must be a positive integer (got {entries!r})")
 
 
 def _validate(cfg: dict) -> None:
@@ -285,6 +374,8 @@ def _validate(cfg: dict) -> None:
     ttl = cfg.get("response_cache_ttl", 300)
     if not isinstance(ttl, (int, float)) or ttl < 0:
         _die(f"response_cache_ttl must be a non-negative number (got {ttl!r})")
+
+    _validate_mesh_knowledge(cfg["mesh_knowledge"])
 
 
 def _die(message: str) -> None:

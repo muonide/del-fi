@@ -4,7 +4,6 @@ Covers: markdown stripping, whitespace collapsing, sentence boundary
 detection, byte counting, chunking, [!more] placement, provenance tags.
 """
 
-import sys
 import unittest
 
 from del_fi.core.formatter import (

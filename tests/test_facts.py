@@ -396,6 +396,7 @@ class MockPeerCache:
 
 
 class MockGossipDir:
+    enabled = True
     peer_count = 0
     def list_peers(self): return []
     def receive(self, nid, txt): pass
