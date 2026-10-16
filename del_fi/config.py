@@ -49,6 +49,7 @@ DEFAULTS: dict = {
     # --- Ollama ---
     "ollama_host": "http://localhost:11434",
     "ollama_timeout": 120,
+    "ollama_keep_alive": -1,             # keep the model loaded (-1 = always, or "30m")
     "wiki_build_timeout": 600,  # seconds per page; large models need more time
     "embedding_model": "nomic-embed-text",
     "num_ctx": None,
@@ -129,6 +130,15 @@ ORACLE_PROFILES: dict[str, dict] = {
     },
 }
 
+# Profiles by parameter count, for models no profile above matches (qwen3,
+# llama, phi, ...). Applied once Ollama reports the model's size; keys set
+# in config.yaml still win. (upper bound in billions, label, overrides)
+SIZE_PROFILES: tuple[tuple[float, str, dict], ...] = (
+    (2.5, "small", ORACLE_PROFILES["gemma3:1b"]),
+    (9.0, "mid", ORACLE_PROFILES["gemma4:e4b"]),
+    (float("inf"), "large", ORACLE_PROFILES["gemma4:12b"]),
+)
+
 # Protocol-specific defaults merged when mesh_protocol is set
 MESHCORE_DEFAULTS: dict = {
     "port": "/dev/ttyUSB0",
@@ -162,15 +172,24 @@ MIN_ANNOUNCE_INTERVAL = 900
 _NODE_ID = re.compile(r"^![0-9a-fA-F]{8}$")
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$")
 _DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_KEEP_ALIVE = re.compile(r"^-?(\d+(\.\d+)?(ms|s|m|h))+$|^-?\d+$")  # Ollama's duration syntax
+
+
+def _match_profile_key(model: str) -> str:
+    """The ORACLE_PROFILES key matching a model name, or ""."""
+    model_lower = model.lower()
+    return next((key for key in ORACLE_PROFILES if key in model_lower), "")
 
 
 def _match_profile(model: str) -> dict | None:
     """Return oracle profile overrides for a known model, or None."""
-    model_lower = model.lower()
-    for profile_key, profile_vals in ORACLE_PROFILES.items():
-        if profile_key in model_lower:
-            return profile_vals
-    return None
+    key = _match_profile_key(model)
+    return ORACLE_PROFILES[key] if key else None
+
+
+def size_profile(billions: float) -> tuple[str, dict]:
+    """(label, overrides) for a model with this many billion parameters."""
+    return next((label, vals) for limit, label, vals in SIZE_PROFILES if billions <= limit)
 
 
 class ConfigError(Exception):
@@ -194,18 +213,22 @@ def default_config_path() -> str:
     return os.path.expanduser("~/del-fi/config.yaml")
 
 
-def load_config(config_path: str | None = None) -> dict:
+def load_config(config_path: str | None = None, overrides: dict | None = None) -> dict:
     """Load, validate, and return config dict. Prints the problem and exits
     on bad config."""
     try:
-        return read_config(config_path)
+        return read_config(config_path, overrides)
     except ConfigError as e:
         print(f"[del-fi] Config error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def read_config(config_path: str | None = None) -> dict:
-    """Load, validate, and return config dict. Raises ConfigError."""
+def read_config(config_path: str | None = None, overrides: dict | None = None) -> dict:
+    """Load, validate, and return config dict. Raises ConfigError.
+
+    *overrides* (e.g. --model from the command line) replace keys from the
+    file, as if they were written there.
+    """
     path = Path(config_path or default_config_path())
     if not path.exists():
         _die(
@@ -220,6 +243,7 @@ def read_config(config_path: str | None = None) -> dict:
         _die(f"Invalid YAML in {path}:\n  {e}")
     if not isinstance(raw, dict):
         _die(f"{path} must be a YAML mapping of 'key: value' lines")
+    raw.update(overrides or {})
 
     if "node_name" not in raw or not str(raw["node_name"] or "").strip():
         _die(f"Missing required config field: 'node_name'\n  Add it to {path}")
@@ -234,10 +258,13 @@ def read_config(config_path: str | None = None) -> dict:
     if not isinstance(cfg.get("model"), str) or not cfg["model"].strip():
         _die(f"model must be an Ollama model name like 'gemma3:4b' (got {cfg.get('model')!r})")
 
-    # Apply oracle profile for known small models
-    profile = _match_profile(cfg.get("model", ""))
-    if profile:
-        for key, val in profile.items():
+    # Apply oracle profile for known small models. Other models get a
+    # profile by size once Ollama reports it (WikiEngine), for the keys
+    # not set in the file.
+    cfg["_profile"] = _match_profile_key(cfg["model"])
+    cfg["_explicit_keys"] = sorted(str(k) for k in raw)
+    if cfg["_profile"]:
+        for key, val in ORACLE_PROFILES[cfg["_profile"]].items():
             if key not in raw:
                 cfg[key] = val
         log.debug(f"oracle profile applied for model '{cfg['model']}'")
@@ -416,6 +443,15 @@ def _validate(cfg: dict) -> None:
     timeout = cfg.get("ollama_timeout")
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
         _die(f"ollama_timeout must be a positive number of seconds (got {timeout!r})")
+
+    keep_alive = cfg.get("ollama_keep_alive")
+    if isinstance(keep_alive, bool) or not (
+        isinstance(keep_alive, (int, float)) or _KEEP_ALIVE.match(str(keep_alive))
+    ):
+        _die(
+            "ollama_keep_alive must be -1 (keep the model loaded), a number of "
+            f"seconds, or a duration like \"30m\" (got {keep_alive!r})"
+        )
 
     if cfg["mesh_protocol"] not in SUPPORTED_PROTOCOLS:
         _die(

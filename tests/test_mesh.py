@@ -2,6 +2,8 @@
 
 import io
 import queue
+import time
+import types
 import unittest
 import unittest.mock
 
@@ -164,12 +166,16 @@ class _FakeInterface:
         self.node_id = node_id
         self.sent: list[tuple] = []
         self.closed = False
+        self.next_packet_id = 1000
 
     def getMyNodeInfo(self):
-        return {"user": {"id": self.node_id}}
+        return {"num": int(self.node_id[1:], 16), "user": {"id": self.node_id}}
 
     def sendText(self, text, destinationId="^all", wantAck=False, channelIndex=0):
+        """Like meshtastic's: returns the sent packet, whose id ACKs refer to."""
         self.sent.append((text, destinationId, wantAck, channelIndex))
+        self.next_packet_id += 1
+        return types.SimpleNamespace(id=self.next_packet_id)
 
     def close(self):
         self.closed = True
@@ -221,8 +227,79 @@ class TestMeshtasticAdapter(unittest.TestCase):
         a.connect()  # reconnect
         self.assertEqual(a.my_node_id, "!00c0ffee")
         self.assertEqual(sorted(a.subscriptions),
-                         ["meshtastic.connection.lost", "meshtastic.receive.text"])
+                         ["meshtastic.connection.lost", "meshtastic.receive.routing",
+                          "meshtastic.receive.text"])
         self.assertTrue(a.opened[0].closed, "old interface closed on reconnect")
+
+    # --- delivery reports (ACK/NAK) ---
+
+    def _routing(self, request_id, reason=None, from_id="!a1b2c3d4", from_num=0xA1B2C3D4):
+        routing = {} if reason is None else {"errorReason": reason}
+        return {"from": from_num, "fromId": from_id,
+                "decoded": {"portnum": "ROUTING_APP", "requestId": request_id, "routing": routing}}
+
+    def test_ack_from_destination_logs_delivered(self):
+        a = self._connected()
+        a.send_dm("!a1b2c3d4", "hello")
+        with self.assertLogs("del_fi.mesh.meshtastic", "INFO") as logs:
+            a._on_routing(self._routing(1001))
+        self.assertIn("delivered to !a1b2c3d4", logs.output[0])
+        self.assertEqual(len(a._pending), 0)
+
+    def test_implicit_ack_then_real_ack(self):
+        a = self._connected()
+        a.send_dm("!a1b2c3d4", "hello")
+        own = self._routing(1001, from_id="!00c0ffee", from_num=0x00C0FFEE)
+        with self.assertLogs("del_fi.mesh.meshtastic", "INFO") as logs:
+            a._on_routing(own)
+            a._on_routing(own)                      # repeated implicit ACK: logged once
+            a._on_routing(self._routing(1001, reason="NONE"))
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("relayed toward !a1b2c3d4", logs.output[0])
+        self.assertIn("delivered to !a1b2c3d4", logs.output[1])
+
+    def test_nak_logs_reason(self):
+        a = self._connected()
+        a.send_dm("!a1b2c3d4", "hello")
+        with self.assertLogs("del_fi.mesh.meshtastic", "WARNING") as logs:
+            a._on_routing(self._routing(1001, reason="MAX_RETRANSMIT",
+                                        from_id="!00c0ffee", from_num=0x00C0FFEE))
+        self.assertIn("not delivered to !a1b2c3d4: MAX_RETRANSMIT", logs.output[0])
+        self.assertEqual(len(a._pending), 0)
+
+    def test_unrelated_routing_packets_ignored(self):
+        a = self._connected()
+        a.send_dm("!a1b2c3d4", "hello")
+        with self.assertNoLogs("del_fi.mesh.meshtastic", "INFO"):
+            a._on_routing(self._routing(4242))      # not one of ours
+            a._on_routing({"decoded": {}})          # no requestId
+        self.assertEqual(len(a._pending), 1)
+
+    def test_no_tracking_without_want_ack(self):
+        a = self._connected(want_ack=False)
+        a.send_dm("!a1b2c3d4", "hello")
+        self.assertEqual(len(a._pending), 0)
+
+    def test_pending_reports_are_bounded(self):
+        from del_fi.mesh.meshtastic_adapter import PENDING_MAX
+        a = self._connected()
+        for i in range(PENDING_MAX + 10):
+            a.send_dm("!a1b2c3d4", f"msg {i}")
+        self.assertEqual(len(a._pending), PENDING_MAX)
+
+    def test_unconfirmed_messages_are_reported_once(self):
+        from del_fi.mesh.meshtastic_adapter import PENDING_TIMEOUT
+        a = self._connected()
+        a.send_dm("!a1b2c3d4", "hello")       # packet 1001: relayed, then silence
+        a.send_dm("!a1b2c3d4", "anyone?")     # packet 1002: no report at all
+        a._on_routing(self._routing(1001, from_id="!00c0ffee", from_num=0x00C0FFEE))
+        a._expire_pending(now=time.monotonic() + PENDING_TIMEOUT - 5)
+        self.assertEqual(len(a._pending), 2)
+        with self.assertLogs("del_fi.mesh.meshtastic", "WARNING") as logs:
+            a._expire_pending(now=time.monotonic() + PENDING_TIMEOUT + 1)
+        self.assertIn("5B to !a1b2c3d4: relayed, but no ACK from !a1b2c3d4", logs.output[0])
+        self.assertIn("7B to !a1b2c3d4: no ACK or NAK within", logs.output[1])
+        self.assertEqual(len(a._pending), 0)
 
     def test_connect_failure_returns_false(self):
         a = _TestableMeshtastic(self.cfg, fail_connects=1)

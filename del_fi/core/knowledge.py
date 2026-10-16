@@ -27,9 +27,11 @@ import re
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from del_fi.config import size_profile
 from del_fi.core.fsutil import write_atomic
 from del_fi.core.text import tokenize
 
@@ -92,6 +94,9 @@ _IDK_PATTERNS = (
 )
 
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---[ \t]*\n?", re.DOTALL)
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_PARAM_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMBT])", re.IGNORECASE)
+_PARAM_UNITS = {"K": 1e-6, "M": 1e-3, "B": 1.0, "T": 1e3}   # -> billions
 _HEADING = re.compile(r"^#{1,6}\s+\S")
 _FIRST_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -107,6 +112,89 @@ class LLMError(Exception):
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
         self.kind = kind
+
+
+@dataclass
+class AnswerStats:
+    """Where the time went in one Tier 1 answer. Durations are seconds.
+
+    The Ollama fields are None when the server does not report them (it
+    omits prompt tokens when the whole prompt was already cached).
+    """
+
+    pages: tuple[str, ...] = ()        # wiki pages whose passages were used
+    context_chars: int = 0
+    retrieve_s: float = 0.0            # page search + passage selection
+    llm_s: float = 0.0                 # the generate call, wall clock
+    load_s: float | None = None        # loading the model into memory
+    prompt_tokens: int | None = None
+    prompt_s: float | None = None
+    output_tokens: int | None = None
+    output_s: float | None = None
+    done_reason: str | None = None     # "length": stopped at num_predict
+
+    @property
+    def prompt_rate(self) -> float | None:
+        return _rate(self.prompt_tokens, self.prompt_s)
+
+    @property
+    def output_rate(self) -> float | None:
+        return _rate(self.output_tokens, self.output_s)
+
+    def record(self, response) -> None:
+        """Copy Ollama's timing fields (nanoseconds) from a generate response."""
+        self.load_s = _seconds(getattr(response, "load_duration", None))
+        self.prompt_tokens = getattr(response, "prompt_eval_count", None)
+        self.prompt_s = _seconds(getattr(response, "prompt_eval_duration", None))
+        self.output_tokens = getattr(response, "eval_count", None)
+        self.output_s = _seconds(getattr(response, "eval_duration", None))
+        self.done_reason = getattr(response, "done_reason", None)
+
+    def summary(self) -> str:
+        """One log line, e.g. "tier1: trails (1650 chars of context, 0.02s) · LLM 39.7s:
+        load 0.1s, prompt 612 tok at 62.4 tok/s, output 71 tok at 4.1 tok/s"."""
+        pages = ", ".join(self.pages) or "-"
+        line = (f"tier1: {pages} ({self.context_chars} chars of context, {self.retrieve_s:.2f}s)"
+                f" · LLM {self.llm_s:.1f}s")
+        parts = []
+        if self.load_s is not None:
+            parts.append(f"load {self.load_s:.1f}s")
+        for label, tokens, rate in (("prompt", self.prompt_tokens, self.prompt_rate),
+                                    ("output", self.output_tokens, self.output_rate)):
+            if tokens is not None:
+                parts.append(f"{label} {tokens} tok" + (f" at {rate:.1f} tok/s" if rate else ""))
+        if parts:
+            line += ": " + ", ".join(parts)
+        if self.done_reason == "length":
+            line += " — stopped at num_predict, answer cut short"
+        return line
+
+
+@dataclass
+class ModelInfo:
+    """What Ollama reports about a model (ollama show)."""
+
+    parameter_size: str = ""            # as Ollama writes it: "4.0B", "751.63M"
+    billions: float | None = None
+    capabilities: tuple[str, ...] = ()
+
+    @property
+    def thinks(self) -> bool:
+        """A reasoning model (qwen3, deepseek-r1, ...) that thinks before
+        answering unless told not to."""
+        return "thinking" in self.capabilities
+
+
+class _ModelMissing(Exception):
+    """Ollama answered 404: the model is not pulled."""
+
+
+def _seconds(nanoseconds) -> float | None:
+    return nanoseconds / 1e9 if isinstance(nanoseconds, (int, float)) else None
+
+
+def _rate(tokens, seconds) -> float | None:
+    return tokens / seconds if tokens and seconds else None
 
 
 def _classify_llm_error(exc: Exception) -> str:
@@ -183,6 +271,7 @@ class WikiEngine:
     wiki_available                    True when wiki/ has pages
     page_count                        number of wiki pages
     get_topics()                      list of page titles from index
+    last_stats                        AnswerStats of the latest LLM answer
     """
 
     def __init__(self, cfg: dict):
@@ -197,10 +286,15 @@ class WikiEngine:
         self._lock = threading.Lock()
         self._file_hashes: dict[str, str] = {}   # source filename -> md5
         self._hash_cache_file = self._wiki_dir / ".hash_cache.json"
+        self.last_stats: AnswerStats | None = None
+        self._pulled: set[str] | None = None     # model names Ollama has; None = unknown
+        self._model_infos: dict[str, ModelInfo] = {}
 
         self._init_ollama()
         self._init_vectorstore()
         self._load_hash_cache()
+        if self._ollama_available:
+            self._check_models()
 
     # --- Initialization ---
 
@@ -211,7 +305,7 @@ class WikiEngine:
                 host=self.cfg["ollama_host"],
                 timeout=self.cfg["ollama_timeout"],
             )
-            self._ollama.list()
+            self._pulled = _model_names(self._ollama.list())
             self._ollama_available = True
             log.info(f"ollama connected at {self.cfg['ollama_host']}")
             # Separate client with a longer timeout for --build-wiki.
@@ -252,7 +346,92 @@ class WikiEngine:
         if self._ollama_available:
             return True
         self._init_ollama()
+        if self._ollama_available:
+            self._check_models()
         return self._ollama_available
+
+    # --- Models ---
+
+    def has_model(self, name: str) -> bool:
+        """True if Ollama has *name* pulled (True if Ollama can't say)."""
+        key = _model_key(name)
+        if self._pulled is not None and key not in self._pulled and self._ollama is not None:
+            try:  # it may have been pulled since we last asked
+                self._pulled = _model_names(self._ollama.list())
+            except Exception as e:
+                log.debug(f"ollama list failed: {e}")
+        return self._pulled is None or key in self._pulled
+
+    def model_info(self, name: str) -> ModelInfo | None:
+        """Size and capabilities of a model from Ollama (cached); None if
+        Ollama could not say."""
+        info = self._model_infos.get(name)
+        if info is None and self._ollama is not None:
+            try:
+                info = _parse_show(self._ollama.show(name))
+            except Exception as e:
+                log.debug(f"ollama show {name} failed: {e}")
+                return None
+            self._model_infos[name] = info
+        return info
+
+    def _think_option(self, model: str) -> dict:
+        """think=False for reasoning models: on a 300-token budget, thinking
+        would use it all up before the answer starts."""
+        info = self.model_info(model)
+        return {"think": False} if info and info.thinks else {}
+
+    def _check_models(self) -> None:
+        """Warn about models that are not pulled, apply a size profile to a
+        model no name profile matched, and log how answers will be run."""
+        model = self.cfg["model"]
+        if not self.has_model(model):
+            log.error(f"model {model!r} is not pulled in Ollama — run: ollama pull {model}")
+            return
+        emb = self.cfg.get("embedding_model")
+        if self._rag_available and emb and not self.has_model(emb):
+            log.warning(
+                f"embedding model {emb!r} is not pulled, so semantic search "
+                f"won't work — run: ollama pull {emb}"
+            )
+
+        info = self.model_info(model)
+        if info and info.billions and not self.cfg.get("_profile"):
+            label, overrides = size_profile(info.billions)
+            explicit = set(self.cfg.get("_explicit_keys", self.cfg))
+            for key, value in overrides.items():
+                if key not in explicit:
+                    self.cfg[key] = value
+            self.cfg["_profile"] = f"{label} (by size)"
+
+        size = info.parameter_size if info and info.parameter_size else "size unknown"
+        thinking = ", thinking off" if info and info.thinks else ""
+        log.info(
+            f"model {model}: {size}{thinking} · profile {self.cfg.get('_profile') or 'default'}"
+            f" · context {self._context_tokens()} tok, num_ctx {self.num_ctx()},"
+            f" num_predict {self._num_predict()}"
+        )
+
+    def warm_up(self) -> float | None:
+        """Load the serving model into memory now, so the first question
+        doesn't wait for it. Returns the seconds it took, or None."""
+        model = self.cfg["model"]
+        keep_alive = self.cfg.get("ollama_keep_alive", -1)
+        if not self._ollama_available or not self.has_model(model) or keep_alive in (0, "0"):
+            return None
+        log.info(f"loading {model} into memory...")
+        started = time.monotonic()
+        try:
+            # An empty prompt only loads the model. Same num_ctx as answers,
+            # or the first answer would reload it.
+            self._ollama.generate(model=model, prompt="", keep_alive=keep_alive,
+                                  options={"num_ctx": self.num_ctx()})
+        except Exception as e:
+            log.warning(f"could not load {model} after {time.monotonic() - started:.1f}s: {e}")
+            return None
+        took = time.monotonic() - started
+        log.info(f"model {model} loaded in {took:.1f}s")
+        return took
 
     # --- Properties ---
 
@@ -296,6 +475,9 @@ class WikiEngine:
 
         builder_model = model or self.cfg.get("wiki_builder_model") or self.cfg["model"]
         log.info(f"building wiki with model {builder_model!r}")
+        if not self.has_model(builder_model):
+            log.error(f"model {builder_model!r} is not pulled in Ollama — run: ollama pull {builder_model}")
+            return 0
 
         if file:
             targets = [Path(file)]
@@ -307,6 +489,9 @@ class WikiEngine:
         for path in targets:
             try:
                 slug = self._build_page(path, builder_model)
+            except _ModelMissing:
+                log.error(f"model {builder_model!r} is not pulled in Ollama — run: ollama pull {builder_model}")
+                break
             except Exception:
                 log.exception(f"build failed for {path.name}")
                 continue
@@ -354,6 +539,7 @@ class WikiEngine:
         budgets = [self._BUILD_NUM_PREDICT] + [self._BUILD_NUM_PREDICT_RETRY] * max_retries
 
         client = self._ollama_build or self._ollama
+        think = self._think_option(model)
         text = ""
         for attempt, budget in enumerate(budgets):
             try:
@@ -365,10 +551,13 @@ class WikiEngine:
                         "num_ctx": BUILD_NUM_CTX,
                         "temperature": 0.1,
                     },
+                    **think,
                 )
-                text = _strip_code_fence(response.response.strip())
+                text = _strip_code_fence(_strip_thinking(response.response))
                 done_reason = getattr(response, "done_reason", None)
             except Exception as e:
+                if getattr(e, "status_code", None) == 404:
+                    raise _ModelMissing(model) from e
                 log.error(f"LLM build failed for {filename} (attempt {attempt + 1}): {e}")
                 return None
 
@@ -567,17 +756,22 @@ class WikiEngine:
         if not self._ollama_available:
             return "", False
 
+        started = time.monotonic()
         page_slugs = self._find_pages(q)
         if not page_slugs:
             return "", False
 
         budget = self._context_budget_chars(history, board_context, peer_ctx)
-        context = self._build_context(q, page_slugs[:MAX_CONTEXT_PAGES], budget)
+        context, used = self._build_context(q, page_slugs[:MAX_CONTEXT_PAGES], budget)
         if not context:
             return "", False
 
-        answer = self._generate(q, context, peer_ctx=peer_ctx, history=history,
+        stats = AnswerStats(pages=tuple(used), context_chars=len(context),
+                            retrieve_s=time.monotonic() - started)
+        answer = self._generate(q, context, stats, peer_ctx=peer_ctx, history=history,
                                 board_context=board_context)
+        self.last_stats = stats
+        log.info(stats.summary())
         # _generate returns "" when the model declines (IDK) — treat as no
         # match so the router falls through to the next tier rather than
         # caching a dead response. Generation failures raise LLMError.
@@ -621,13 +815,14 @@ class WikiEngine:
         available = window - sum(len(x) for x in extras if x)
         return max(MIN_CONTEXT_CHARS, min(wanted, available))
 
-    def _build_context(self, q: str, slugs: list[str], budget: int) -> str:
+    def _build_context(self, q: str, slugs: list[str], budget: int) -> tuple[str, list[str]]:
         """Assemble the most relevant passages from the pages' sources.
 
         Each page's source files (or the page itself, if its sources are not
         on this node) are split into section passages, ranked against the
         question with BM25, and added best-first until *budget* chars are
-        used. Output keeps document order within each page.
+        used. Output keeps document order within each page. Returns the
+        context and the slugs of the pages it drew from.
         """
         ts_files = self.cfg.get("time_sensitive_files") or []
         pages: list[tuple[int, str]] = []                 # (rank, header)
@@ -668,7 +863,7 @@ class WikiEngine:
             flat += [(rank, src, i, text) for src, i, text in passages]
 
         if not pages:
-            return ""
+            return "", []
 
         q_terms = tokenize(q)
         corpus = [(str(i), tokenize(text)) for i, (_, _, _, text) in enumerate(flat)]
@@ -711,17 +906,19 @@ class WikiEngine:
         for rank, header in order:
             idxs = sorted(by_rank[rank], key=lambda i: (flat[i][1], flat[i][2]))
             parts.append(header + "\n" + "\n\n".join(flat[i][3] for i in idxs))
-        return "\n\n---\n\n".join(parts)
+        return "\n\n---\n\n".join(parts), [slugs[rank] for rank, _ in order]
 
     def _generate(
         self,
         query: str,
         context: str,
+        stats: AnswerStats,
         peer_ctx: str = "",
         history: str = "",
         board_context: str = "",
     ) -> str:
-        """Call Ollama to generate an answer from context."""
+        """Call Ollama to generate an answer from context, recording its
+        timing in *stats*."""
         name = self.cfg["node_name"]
         personality = self.cfg.get("personality", "")
 
@@ -741,23 +938,42 @@ class WikiEngine:
 
         prompt = "\n\n".join(parts)
 
+        model = self.cfg["model"]
         options = {"num_predict": self._num_predict(), "num_ctx": self.num_ctx()}
+        extra = self._think_option(model)
+        if self.cfg.get("ollama_keep_alive") is not None:
+            extra["keep_alive"] = self.cfg["ollama_keep_alive"]
 
+        started = time.monotonic()
         try:
             response = self._ollama.generate(
-                model=self.cfg["model"],
+                model=model,
                 system=system,
                 prompt=prompt,
                 options=options,
+                **extra,
             )
-            text = response.response.strip()
+            raw = response.response or ""
         except Exception as e:
             kind = _classify_llm_error(e)
             if kind == "unavailable":
                 # Let the health-check loop take over until Ollama is back.
                 self._ollama_available = False
-            log.error(f"LLM generation failed ({kind}): {e}")
-            raise LLMError(kind, str(e)) from e
+            detail = str(e)
+            if getattr(e, "status_code", None) == 404:
+                detail = f"model {model!r} is not pulled — run: ollama pull {model}"
+            log.error(f"LLM generation failed ({kind}) after "
+                      f"{time.monotonic() - started:.1f}s: {detail}")
+            raise LLMError(kind, detail) from e
+        stats.llm_s = time.monotonic() - started
+        stats.record(response)
+
+        text = _strip_thinking(raw)
+        if not text and (getattr(response, "thinking", None) or "<think>" in raw.lower()):
+            log.warning(
+                f"{model} spent its num_predict ({self._num_predict()} tokens) thinking "
+                f"and gave no answer — update Ollama so Del-Fi can turn thinking off"
+            )
 
         # If the LLM refused to answer from context, return "" so the caller
         # falls through rather than caching a useless response.
@@ -1245,6 +1461,56 @@ def index_slugs(index_content: str) -> list[str]:
 def _table_cell(text: str) -> str:
     """Make text safe for one markdown table cell."""
     return " ".join(text.split()).replace("|", "/")
+
+
+def _strip_thinking(text: str) -> str:
+    """Drop <think>...</think> reasoning some models write into the answer.
+    An unclosed <think> means the model ran out of tokens while thinking,
+    so nothing after it is an answer."""
+    text = _THINK_BLOCK.sub("", text or "")
+    start = text.lower().find("<think>")
+    if start != -1:
+        text = text[:start]
+    return text.strip()
+
+
+def _model_key(name: str) -> str:
+    """Compare model names as Ollama does: no tag means ':latest'."""
+    name = str(name).strip().lower()
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
+
+def _field(obj, name: str):
+    """Attribute of an ollama response object, or key of a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _model_names(listing) -> set[str]:
+    """Model names from ollama list, normalised by _model_key."""
+    names = set()
+    for m in _field(listing, "models") or []:
+        name = _field(m, "model") or _field(m, "name")
+        if name:
+            names.add(_model_key(name))
+    return names
+
+
+def _parse_show(shown) -> ModelInfo:
+    """ModelInfo from an ollama show response."""
+    size = str(_field(_field(shown, "details") or {}, "parameter_size") or "")
+    billions = None
+    m = _PARAM_SIZE.match(size)
+    if m:
+        billions = float(m.group(1)) * _PARAM_UNITS[m.group(2).upper()]
+    if not billions:
+        info = _field(shown, "modelinfo") or _field(shown, "model_info") or {}
+        count = info.get("general.parameter_count")
+        if isinstance(count, (int, float)) and count > 0:
+            billions = count / 1e9
+    caps = tuple(str(c) for c in _field(shown, "capabilities") or ())
+    return ModelInfo(parameter_size=size, billions=billions or None, capabilities=caps)
 
 
 def _strip_code_fence(text: str) -> str:

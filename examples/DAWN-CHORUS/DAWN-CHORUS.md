@@ -28,6 +28,7 @@ A birding oracle for Salmonberry Creek Preserve, a fictional 160-acre wetland an
 examples/DAWN-CHORUS/
   DAWN-CHORUS.md       this guide
   birdnet_feed.py      BirdNET-Pi detections → Del-Fi sensor facts (run every minute)
+  bench-questions.txt  visitor questions for timing answers: python main.py --bench
   knowledge/           the source documents below
 ```
 
@@ -179,7 +180,7 @@ Node:  [!7c3e just now]: Pileated Woodpecker at Cedar Trail footbridge 2,
 ## Hardware and Placement
 
 - **Microphone:** an omnidirectional USB microphone in a rain shield, about 10 ft up under the eaves of the Beaver Pond Blind, away from dripping water and the wind. It hears the pond, the marsh and the forest edge; the knowledge base says so, so users know what it cannot hear.
-- **Computers:** BirdNET-Pi is happiest on its own Raspberry Pi (a Pi 4 is enough), with Del-Fi and Ollama on a Raspberry Pi 5 8GB, in one weatherproof box linked by a short Ethernet cable. Running both on one Pi 5 may work with a 1B model; measure it before relying on it.
+- **Computers:** BirdNET-Pi is happiest on its own Raspberry Pi (a Pi 4 is enough), with Del-Fi and Ollama on a Raspberry Pi 5 8GB, in one weatherproof box linked by a short Ethernet cable. Running both on one Pi 5 may work with a 1B model; measure it before relying on it: `python main.py --bench bench-questions.txt` times ten typical visitor questions, and `--model` tries another model.
 - **Radio:** any Meshtastic radio with an outdoor antenna on the blind's roof. A 160-acre preserve is well within one node's range.
 - **Power:** two Pis and a radio draw very roughly 10–15 W around the clock. Solar through a Northwest winter needs a large panel and battery, so measure your draw with a USB power meter before sizing it, or use mains power if the site has it.
 

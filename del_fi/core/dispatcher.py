@@ -60,7 +60,7 @@ class Dispatcher:
         self.busy_notice: bool = cfg.get("busy_notice", True)
         self.query_queue_size: int = cfg.get("query_queue_size", DEFAULT_QUERY_QUEUE_SIZE)
 
-        self.query_queue: queue.Queue = queue.Queue()
+        self.query_queue: queue.Queue = queue.Queue()  # (sender, text, queued at)
         self._stop = threading.Event()
         self._worker_busy = threading.Event()
         self._worker: threading.Thread | None = None
@@ -172,19 +172,23 @@ class Dispatcher:
             self._safe_send(sender_id, self.router.busy_message(position))
             log.info(f"  ⏳ busy notice → {sender_id} (position {position})")
 
-        self.query_queue.put((sender_id, text))
+        self.query_queue.put((sender_id, text, now))
 
     # --- Worker ---
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                sender_id, text = self.query_queue.get(timeout=0.5)
+                sender_id, text, queued_at = self.query_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             self._worker_busy.set()
+            started = self._clock()
             try:
-                self._send_all(sender_id, self.router.route_multi(sender_id, text))
+                messages = self.router.route_multi(sender_id, text)
+                took = self._clock() - started
+                self._send_all(sender_id, messages,
+                               f" · answered in {took:.1f}s, queued {started - queued_at:.1f}s")
             except Exception:
                 log.exception(f"error processing query from {sender_id}")
                 self._safe_send(sender_id, "I hit an error processing that. Try again.")
@@ -200,7 +204,7 @@ class Dispatcher:
 
     # --- Sending ---
 
-    def _send_all(self, sender_id: str, messages: list[str] | None) -> None:
+    def _send_all(self, sender_id: str, messages: list[str] | None, timing: str = "") -> None:
         if not messages:
             return
         for i, msg in enumerate(messages):
@@ -208,7 +212,7 @@ class Dispatcher:
                 self._sleep(AUTO_SEND_DELAY)
             self._safe_send(sender_id, msg)
         total = sum(byte_len(m) for m in messages)
-        log.info(f"  ✓ response: {len(messages)} msg(s), {total}B → {sender_id}")
+        log.info(f"  ✓ response: {len(messages)} msg(s), {total}B → {sender_id}{timing}")
 
     def _safe_send(self, sender_id: str, text: str) -> None:
         try:

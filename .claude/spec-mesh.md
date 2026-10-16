@@ -74,11 +74,12 @@ what the Meshtastic apps do for DMs.
 
 ### 2.2 Receiving
 
-The adapter subscribes (once) to two meshtastic pub/sub topics:
+The adapter subscribes (once) to three meshtastic pub/sub topics:
 
 | Topic | Handler |
 |-------|---------|
 | `meshtastic.receive.text` | `_on_receive(packet, interface)` |
+| `meshtastic.receive.routing` | `_on_routing(packet, interface)` → delivery reports (§2.7) |
 | `meshtastic.connection.lost` | `_on_connection_lost(interface)` → marks the link down |
 
 `_on_receive` drops packets with no sender or text, the node's own
@@ -117,12 +118,30 @@ not only when the first `connect()` fails — so a radio that drops later
 
 ```
 while not stopped:
-    if connected: wait 5 s; continue
+    if connected: report expired delivery checks (§2.7); wait 5 s; continue
     connect()  (closes the old interface first)
     on failure: wait 10 s, doubling to at most 120 s
 ```
 
 `close()` sets the stop event, unsubscribes and closes the interface.
+
+### 2.7 Delivery reports
+
+With `want_ack: true`, every DM part sent is remembered by packet ID (the
+latest 256) until its fate is known, and each outcome is logged:
+
+| Log line | Meaning |
+|----------|---------|
+| `→ sent 201B to !id` | handed to the radio |
+| `↪ relayed toward !id after 4.1s (implicit ACK)` | our radio heard a neighbour rebroadcast it; the firmware stops retrying. Logged once. |
+| `✓ delivered to !id in 6.2s (201B)` | the destination's ACK arrived |
+| `✗ not delivered to !id: MAX_RETRANSMIT after 38.0s (201B)` | a NAK, with the firmware's reason (`NO_ROUTE`, `TOO_LARGE`, `PKI_UNKNOWN_PUBKEY`, ...) |
+| `? 201B to !id: relayed, but no ACK from !id within 180s` | relayed but never confirmed, or neither ACK nor NAK arrived |
+
+Routing packets are told apart by `from`: an ACK (`errorReason` absent or
+`NONE`) from our own node number or ID is the implicit ACK; one from
+anyone else is the destination's. Delivery tracking is logging only — no
+message is resent by Del-Fi (the firmware already retries).
 
 ---
 

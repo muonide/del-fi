@@ -23,11 +23,14 @@ DEFAULT_TCP_PORT = 4403
 GOSSIP_PREFIX = "DEL-FI:"
 
 RECEIVE_TOPIC = "meshtastic.receive.text"
+ROUTING_TOPIC = "meshtastic.receive.routing"  # ACKs and NAKs
 LOST_TOPIC = "meshtastic.connection.lost"
 
 RECONNECT_MIN_DELAY = 10
 RECONNECT_MAX_DELAY = 120
 SUPERVISOR_POLL = 5
+PENDING_MAX = 256          # sent DMs awaiting an ACK or NAK
+PENDING_TIMEOUT = 180      # report a DM with no ACK or NAK after this long (s)
 
 
 def parse_tcp_address(address: str) -> tuple[str, int]:
@@ -53,6 +56,9 @@ class MeshtasticAdapter(MeshAdapter):
         super().__init__(cfg, msg_queue)
         self.interface = None
         self.my_node_id: str | None = None
+        self.my_node_num: int | None = None
+        # packet id -> (destination, bytes, monotonic send time, relayed)
+        self._pending: collections.OrderedDict = collections.OrderedDict()
         self._seen_ids: collections.deque = collections.deque(maxlen=500)
         self._lock = threading.Lock()
         self._connected = False
@@ -73,9 +79,11 @@ class MeshtasticAdapter(MeshAdapter):
             node_info = self.interface.getMyNodeInfo()
             if node_info is not None:
                 self.my_node_id = node_info.get("user", {}).get("id", None)
+                self.my_node_num = node_info.get("num")
 
             if not self._subscribed:
                 self._subscribe(self._on_receive, RECEIVE_TOPIC)
+                self._subscribe(self._on_routing, ROUTING_TOPIC)
                 self._subscribe(self._on_connection_lost, LOST_TOPIC)
                 self._subscribed = True
 
@@ -128,6 +136,7 @@ class MeshtasticAdapter(MeshAdapter):
         while not self._stop.is_set():
             if self._connected:
                 delay = RECONNECT_MIN_DELAY
+                self._expire_pending()
                 self._stop.wait(SUPERVISOR_POLL)
                 continue
             log.info("attempting radio reconnect...")
@@ -147,6 +156,7 @@ class MeshtasticAdapter(MeshAdapter):
         if self._subscribed:
             for listener, topic in (
                 (self._on_receive, RECEIVE_TOPIC),
+                (self._on_routing, ROUTING_TOPIC),
                 (self._on_connection_lost, LOST_TOPIC),
             ):
                 try:
@@ -239,12 +249,72 @@ class MeshtasticAdapter(MeshAdapter):
             return False
 
     def _send_one(self, dest_id: str, text: str) -> bool:
+        nbytes = len(text.encode("utf-8"))
         try:
             # wantAck makes the firmware retry DMs across hops until the
             # destination acknowledges — what the Meshtastic apps do.
-            self.interface.sendText(text, destinationId=dest_id, wantAck=self._want_ack)
-            log.info(f"  ✓ sent {len(text.encode('utf-8'))} bytes → {dest_id}")
-            return True
+            packet = self.interface.sendText(text, destinationId=dest_id, wantAck=self._want_ack)
         except Exception:
             log.exception(f"send failed to {dest_id}")
             return False
+        log.info(f"  → sent {nbytes}B to {dest_id}")
+        packet_id = getattr(packet, "id", None)
+        if self._want_ack and packet_id:
+            with self._lock:
+                self._pending[packet_id] = (dest_id, nbytes, time.monotonic(), False)
+                while len(self._pending) > PENDING_MAX:
+                    self._pending.popitem(last=False)
+        return True
+
+    def _on_routing(self, packet, interface=None):
+        """pubsub callback for ACK/NAK packets: log what happened to a DM.
+
+        The destination's ACK means delivered. An ACK from our own radio is
+        an implicit ACK (a neighbour relayed the message); the real ACK or a
+        NAK may still follow. A NAK carries the reason, e.g. MAX_RETRANSMIT
+        (no ACK after the firmware's retries) or TOO_LARGE.
+        """
+        try:
+            decoded = packet.get("decoded") or {}
+            request_id = decoded.get("requestId")
+            if not request_id:
+                return
+            reason = (decoded.get("routing") or {}).get("errorReason", "NONE")
+            from_self = (
+                (self.my_node_num is not None and packet.get("from") == self.my_node_num)
+                or (self.my_node_id is not None and packet.get("fromId") == self.my_node_id)
+            )
+            with self._lock:
+                entry = self._pending.get(request_id)
+                if entry is None:
+                    return
+                dest, nbytes, sent_at, relayed = entry
+                if reason == "NONE" and from_self:
+                    if relayed:
+                        return
+                    self._pending[request_id] = (dest, nbytes, sent_at, True)
+                else:
+                    del self._pending[request_id]
+            took = time.monotonic() - sent_at
+            if reason != "NONE":
+                log.warning(f"  ✗ not delivered to {dest}: {reason} after {took:.1f}s ({nbytes}B)")
+            elif from_self:
+                log.info(f"  ↪ relayed toward {dest} after {took:.1f}s (implicit ACK)")
+            else:
+                log.info(f"  ✓ delivered to {dest} in {took:.1f}s ({nbytes}B)")
+        except Exception:
+            log.exception("error handling delivery report")
+
+    def _expire_pending(self, now: float | None = None) -> None:
+        """Report DMs that got no ACK or NAK within PENDING_TIMEOUT. After an
+        implicit ACK the firmware stops retrying, so a message lost further
+        along the route is never NAKed."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            expired = [(pid, entry) for pid, entry in self._pending.items()
+                       if now - entry[2] >= PENDING_TIMEOUT]
+            for pid, _ in expired:
+                del self._pending[pid]
+        for _, (dest, nbytes, _, relayed) in expired:
+            what = f"relayed, but no ACK from {dest}" if relayed else "no ACK or NAK"
+            log.warning(f"  ? {nbytes}B to {dest}: {what} within {PENDING_TIMEOUT}s")

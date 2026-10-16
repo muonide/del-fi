@@ -784,7 +784,8 @@ class TestContextBudget(unittest.TestCase):
         _setup_pages(self.tmpdir, {"elk-guide": (["elk"], "## Intro\n\nFirst passage.\n\n## More\n\nSecond.")})
         client = _FakeOllamaClient(generate_response="ok.")
         engine = _make_engine(self.tmpdir, ollama_client=client)
-        context = engine._build_context("zzz", ["elk-guide"], budget=5000)
+        context, used = engine._build_context("zzz", ["elk-guide"], budget=5000)
+        self.assertEqual(used, ["elk-guide"])
         self.assertLess(context.index("First passage"), context.index("Second"))
 
     def test_staleness_uses_source_mtime(self):
@@ -1032,6 +1033,312 @@ class TestEmbeddings(unittest.TestCase):
         engine._delete_embedding("trail-guide")
         self.assertEqual(engine._collection.count(), 1)
         self.assertEqual(engine._vector_search("which trail goes to the summit"), [])
+
+
+class _ModelClient(_FakeOllamaClient):
+    """Reports timing like Ollama does, and answers show/list for one model."""
+
+    def __init__(self, generate_response="", capabilities=("completion",),
+                 parameter_size="4.0B", **response_fields):
+        super().__init__(generate_response)
+        self.capabilities = list(capabilities)
+        self.parameter_size = parameter_size
+        self.response_fields = response_fields
+        self.show_calls: list[str] = []
+
+    def generate(self, model, prompt, options=None, stream=False, **kwargs):
+        super().generate(model, prompt, options, stream, **kwargs)
+        return types.SimpleNamespace(response=self.generate_response, **self.response_fields)
+
+    def show(self, model):
+        self.show_calls.append(model)
+        return types.SimpleNamespace(
+            details=types.SimpleNamespace(parameter_size=self.parameter_size),
+            modelinfo={}, capabilities=self.capabilities,
+        )
+
+
+class _MissingModelError(Exception):
+    """Like ollama.ResponseError for an unpulled model."""
+    status_code = 404
+
+
+class TestAnswerStats(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-stats-")
+        _setup_pages(self.tmpdir, {"songs": (["songs", "chickadee"],
+                                             "## Fee-bee\n\nThe chickadee sings fee-bee.")})
+
+    def test_ollama_timing_is_recorded_and_logged(self):
+        client = _ModelClient(
+            "A Black-capped Chickadee.", load_duration=2_500_000_000,
+            prompt_eval_count=600, prompt_eval_duration=10_000_000_000,
+            eval_count=70, eval_duration=20_000_000_000, done_reason="stop",
+        )
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        with self.assertLogs("del_fi.core.knowledge", "INFO") as logs:
+            answer, had_context = engine.query("what sings fee-bee, a chickadee?")
+        self.assertTrue(had_context)
+        stats = engine.last_stats
+        self.assertEqual(stats.pages, ("songs",))
+        self.assertEqual((stats.prompt_tokens, stats.output_tokens), (600, 70))
+        self.assertAlmostEqual(stats.load_s, 2.5)
+        self.assertAlmostEqual(stats.prompt_rate, 60.0)
+        self.assertAlmostEqual(stats.output_rate, 3.5)
+        line = next(m for m in logs.output if "tier1:" in m)
+        self.assertIn("tier1: songs (", line)
+        self.assertIn("load 2.5s, prompt 600 tok at 60.0 tok/s, output 70 tok at 3.5 tok/s", line)
+        self.assertNotIn("cut short", line)
+
+    def test_missing_timing_fields_still_log_wall_time(self):
+        engine = _make_engine(self.tmpdir, ollama_client=_FakeOllamaClient("Fee-bee."))
+        with self.assertLogs("del_fi.core.knowledge", "INFO") as logs:
+            engine.query("chickadee song")
+        line = next(m for m in logs.output if "tier1:" in m)
+        self.assertRegex(line, r"LLM \d+\.\ds$")
+        self.assertIsNone(engine.last_stats.prompt_rate)
+
+    def test_answer_cut_at_num_predict_is_flagged(self):
+        client = _ModelClient("The chickadee sings", eval_count=300,
+                              eval_duration=60_000_000_000, done_reason="length")
+        engine = _make_engine(self.tmpdir, ollama_client=client)
+        with self.assertLogs("del_fi.core.knowledge", "INFO") as logs:
+            engine.query("chickadee song")
+        self.assertTrue(any("stopped at num_predict" in m for m in logs.output), logs.output)
+
+    def test_failed_generation_logs_elapsed_time(self):
+        class Refusing(_FakeOllamaClient):
+            def generate(self, **kwargs):
+                raise ConnectionError("refused")
+
+        from del_fi.core.knowledge import LLMError
+        engine = _make_engine(self.tmpdir, ollama_client=Refusing())
+        with self.assertLogs("del_fi.core.knowledge", "ERROR") as logs, self.assertRaises(LLMError):
+            engine.query("chickadee song")
+        self.assertRegex(logs.output[0], r"failed \(unavailable\) after \d+\.\ds")
+
+
+class TestModelHandling(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-models-")
+        _setup_pages(self.tmpdir, {"songs": (["songs", "chickadee"],
+                                             "## Fee-bee\n\nThe chickadee sings fee-bee.")})
+
+    def _engine(self, client, **cfg):
+        return _make_engine(self.tmpdir, ollama_client=client, **cfg)
+
+    def test_thinking_model_is_asked_not_to_think(self):
+        client = _ModelClient("Chickadee.", capabilities=["completion", "thinking"])
+        engine = self._engine(client, ollama_keep_alive="30m")
+        engine.query("chickadee song")
+        call = client.generate_calls[0]
+        self.assertIs(call["think"], False)
+        self.assertEqual(call["keep_alive"], "30m")
+
+    def test_other_models_get_no_think_option(self):
+        client = _ModelClient("Chickadee.")
+        self._engine(client).query("chickadee song")
+        self.assertNotIn("think", client.generate_calls[0])
+        self.assertNotIn("keep_alive", client.generate_calls[0])
+
+    def test_model_info_is_cached(self):
+        client = _ModelClient("Chickadee.")
+        engine = self._engine(client)
+        engine.query("chickadee song")
+        engine.query("chickadee song again")
+        self.assertEqual(client.show_calls, ["test-model:3b"])
+
+    def test_think_blocks_are_removed_from_answers(self):
+        client = _ModelClient("<think>Fee-bee is... the chickadee.</think>\n\nA Black-capped Chickadee.")
+        answer, had_context = self._engine(client).query("chickadee song")
+        self.assertEqual(answer, "A Black-capped Chickadee.")
+        self.assertTrue(had_context)
+
+    def test_unclosed_think_means_no_answer_and_a_warning(self):
+        client = _ModelClient("<think>The user asks about a song. Let me consider")
+        engine = self._engine(client)
+        with self.assertLogs("del_fi.core.knowledge", "WARNING") as logs:
+            answer, had_context = engine.query("chickadee song")
+        self.assertEqual((answer, had_context), ("", False))
+        self.assertTrue(any("thinking" in m for m in logs.output), logs.output)
+
+    def test_thinking_field_with_empty_answer_warns(self):
+        client = _ModelClient("", thinking="Let me think about chickadees...")
+        with self.assertLogs("del_fi.core.knowledge", "WARNING") as logs:
+            self._engine(client).query("chickadee song")
+        self.assertTrue(any("num_predict" in m for m in logs.output), logs.output)
+
+    def test_size_profile_applied_to_unknown_small_model(self):
+        client = _ModelClient(parameter_size="2.0B", capabilities=["completion", "thinking"])
+        engine = self._engine(client, model="qwen3:1.7b", _profile="",
+                              _explicit_keys=["node_name", "model"], max_context_tokens=None,
+                              num_ctx=None)
+        with self.assertLogs("del_fi.core.knowledge", "INFO") as logs:
+            engine._check_models()
+        self.assertEqual(engine.cfg["_profile"], "small (by size)")
+        self.assertEqual(engine.cfg["max_context_tokens"], 512)
+        self.assertTrue(engine.cfg["small_model_prompt"])
+        self.assertTrue(any(
+            "model qwen3:1.7b: 2.0B, thinking off · profile small (by size) · context 512 tok" in m
+            for m in logs.output), logs.output)
+
+    def test_size_profile_keeps_keys_set_in_config(self):
+        client = _ModelClient(parameter_size="1.2B")
+        engine = self._engine(client, model="llama3.2:3b-mini", _profile="",
+                              _explicit_keys=["max_context_tokens"], max_context_tokens=900)
+        engine._check_models()
+        self.assertEqual(engine.cfg["max_context_tokens"], 900)
+        self.assertTrue(engine.cfg["small_model_prompt"])
+
+    def test_large_model_gets_the_large_profile(self):
+        engine = self._engine(_ModelClient(parameter_size="14.8B"), model="qwen3:14b",
+                              _profile="", _explicit_keys=[])
+        engine._check_models()
+        self.assertEqual(engine.cfg["_profile"], "large (by size)")
+        self.assertEqual(engine.cfg["max_context_tokens"], 3000)
+
+    def test_name_profile_wins_over_size(self):
+        engine = self._engine(_ModelClient(parameter_size="1.0B"), model="gemma3:1b",
+                              _profile="gemma3:1b", _explicit_keys=[], max_context_tokens=512)
+        engine._check_models()
+        self.assertEqual(engine.cfg["_profile"], "gemma3:1b")
+
+    def test_hand_built_config_is_left_alone(self):
+        engine = self._engine(_ModelClient(parameter_size="1.0B"))  # no _explicit_keys
+        engine._check_models()
+        self.assertEqual(engine.cfg["max_context_tokens"], 2048)
+
+    def test_unpulled_model_is_reported_with_the_fix(self):
+        engine = self._engine(_ModelClient())
+        engine._pulled = {"gemma3:1b"}
+        with self.assertLogs("del_fi.core.knowledge", "ERROR") as logs:
+            engine._check_models()
+        self.assertIn("run: ollama pull test-model:3b", logs.output[0])
+
+    def test_unpulled_embedding_model_warns_when_semantic_search_is_on(self):
+        engine = self._engine(_ModelClient())
+        engine._pulled = {"test-model:3b"}
+        engine._rag_available = True
+        with self.assertLogs("del_fi.core.knowledge", "WARNING") as logs:
+            engine._check_models()
+        self.assertTrue(any("ollama pull nomic-embed-text" in m for m in logs.output), logs.output)
+
+    def test_model_names_match_like_ollama(self):
+        from del_fi.core.knowledge import _model_names
+        engine = self._engine(_ModelClient())
+        engine._pulled = _model_names({"models": [
+            {"model": "nomic-embed-text:latest"}, {"model": "Qwen3:4b"},
+            {"model": "hf.co/unsloth/Qwen3-4B-GGUF:Q4_K_M"},
+        ]})
+        self.assertTrue(engine.has_model("nomic-embed-text"))
+        self.assertTrue(engine.has_model("qwen3:4b"))
+        self.assertTrue(engine.has_model("hf.co/unsloth/Qwen3-4B-GGUF:Q4_K_M"))
+        self.assertFalse(engine.has_model("qwen3:8b"))
+        engine._pulled = None  # Ollama never listed: assume yes
+        self.assertTrue(engine.has_model("anything"))
+
+    def test_models_pulled_after_startup_are_found(self):
+        client = _ModelClient()
+        engine = self._engine(client)
+        engine._pulled = {"test-model:3b"}
+        client.list = lambda: {"models": [{"model": "test-model:3b"}, {"model": "gemma4:12b"}]}
+        self.assertTrue(engine.has_model("gemma4:12b"))
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("ollama"), "ollama not installed")
+    def test_parses_real_ollama_responses(self):
+        from ollama._types import ListResponse, ModelDetails, ShowResponse
+
+        from del_fi.core.knowledge import _model_names, _parse_show
+        info = _parse_show(ShowResponse(details=ModelDetails(parameter_size="751.63M"),
+                                        model_info={}, capabilities=["completion", "thinking"]))
+        self.assertAlmostEqual(info.billions, 0.75163)
+        self.assertTrue(info.thinks)
+        info = _parse_show(ShowResponse(model_info={"general.parameter_count": 3_212_749_888}))
+        self.assertAlmostEqual(info.billions, 3.212749888)
+        self.assertFalse(info.thinks)
+        listing = ListResponse(models=[ListResponse.Model(model="gemma3:1b")])
+        self.assertEqual(_model_names(listing), {"gemma3:1b"})
+
+    def test_warm_up_loads_with_the_answer_context_window(self):
+        client = _ModelClient()
+        engine = self._engine(client, ollama_keep_alive=-1)
+        took = engine.warm_up()
+        self.assertIsInstance(took, float)
+        call = client.generate_calls[0]
+        self.assertEqual(call["prompt"], "")
+        self.assertEqual(call["options"], {"num_ctx": engine.num_ctx()})
+        self.assertEqual(call["keep_alive"], -1)
+
+    def test_warm_up_skipped_for_unpulled_model_or_zero_keep_alive(self):
+        client = _ModelClient()
+        engine = self._engine(client)
+        engine._pulled = set()
+        self.assertIsNone(engine.warm_up())
+        engine._pulled = None
+        engine.cfg["ollama_keep_alive"] = 0
+        self.assertIsNone(engine.warm_up())
+        self.assertEqual(client.generate_calls, [])
+
+    def test_warm_up_failure_is_logged(self):
+        client = _ModelClient()
+        client.generate = unittest.mock.Mock(side_effect=RuntimeError("model requires more system memory"))
+        engine = self._engine(client)
+        with self.assertLogs("del_fi.core.knowledge", "WARNING") as logs:
+            self.assertIsNone(engine.warm_up())
+        self.assertIn("more system memory", logs.output[0])
+
+    def test_answer_from_unpulled_model_says_how_to_fix(self):
+        from del_fi.core.knowledge import LLMError
+        client = _ModelClient()
+        client.generate = unittest.mock.Mock(side_effect=_MissingModelError("model not found"))
+        with self.assertRaises(LLMError) as ctx:
+            self._engine(client).query("chickadee song")
+        self.assertIn("ollama pull test-model:3b", str(ctx.exception))
+
+    def test_build_stops_at_the_first_missing_model_error(self):
+        client = _ModelClient()
+        client.generate = unittest.mock.Mock(side_effect=_MissingModelError("model not found"))
+        engine = self._engine(client)
+        kdir = engine.cfg["knowledge_folder"]
+        _write_file(os.path.join(kdir, "a.md"), "alpha")
+        _write_file(os.path.join(kdir, "b.md"), "beta")
+        with self.assertLogs("del_fi.core.knowledge", "ERROR") as logs:
+            self.assertEqual(engine.build(), 0)
+        self.assertEqual(client.generate.call_count, 1)
+        self.assertTrue(any("ollama pull test-model:3b" in m for m in logs.output), logs.output)
+
+    def test_build_refuses_a_builder_model_that_is_not_pulled(self):
+        client = _ModelClient()
+        engine = self._engine(client, wiki_builder_model="gemma4:12b")
+        engine._pulled = {"test-model:3b"}
+        _write_file(os.path.join(engine.cfg["knowledge_folder"], "a.md"), "alpha")
+        with self.assertLogs("del_fi.core.knowledge", "ERROR"):
+            self.assertEqual(engine.build(), 0)
+        self.assertEqual(client.generate_calls, [])
+
+    def test_thinking_builder_model_writes_pages_without_thoughts(self):
+        page = _make_wiki_page("Alpha", ["alpha"], "Alpha is first.")
+        client = _ModelClient(f"<think>Plan the page.</think>\n{page}",
+                              capabilities=["completion", "thinking"], done_reason="stop")
+        engine = self._engine(client)
+        _write_file(os.path.join(engine.cfg["knowledge_folder"], "alpha.md"), "Alpha is first.")
+        self.assertEqual(engine.build(file=os.path.join(engine.cfg["knowledge_folder"], "alpha.md")), 1)
+        self.assertIs(client.generate_calls[0]["think"], False)
+        text = Path(engine.cfg["wiki_folder"], "alpha.md").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\ntitle: Alpha"), text[:40])
+        self.assertNotIn("think", text)
+
+    def test_reconnect_reruns_the_model_check(self):
+        engine = self._engine(_ModelClient())
+        engine._ollama_available = False
+
+        def connect():
+            engine._ollama_available = True
+
+        with unittest.mock.patch.object(engine, "_init_ollama", side_effect=connect), \
+                unittest.mock.patch.object(engine, "_check_models") as check:
+            self.assertTrue(engine.check_ollama())
+        check.assert_called_once()
 
 
 if __name__ == "__main__":

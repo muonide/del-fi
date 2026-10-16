@@ -300,7 +300,8 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
   Mac Mini M4 ........... ~$499           Heltec V3 is ~$20.
 
   <span class="dim">On a Pi, start with a 1B model;         Antenna placement matters
-  bigger ones answer better, slower.      more than radio choice.</span>
+  bigger ones answer better, slower.      more than radio choice.
+  --bench times them on your hardware.</span>
 </pre>
 </section>
 
@@ -322,6 +323,7 @@ Drop documents into <span class="white">knowledge/</span>, run <span class="whit
   Everything else has sensible defaults.
 
   <span class="dim">No radio? Test with:</span>  python main.py --simulator
+  <span class="dim">Time the answers:</span>     python main.py --bench
 </pre>
 </section>
 
@@ -426,9 +428,10 @@ Full example: </span><a href="https://github.com/geodesic-glitch/del-fi/tree/mai
                                                            Tier 2  <span class="white">PeerCache</span>   trusted peer Q&amp;A
                                                            Tier 3  <span class="white">GossipDir</span>   referrals only
 
-<span class="white">main.py</span> ................. entry point: daemon, --simulator, --build-wiki, --lint-wiki, --gui
+<span class="white">main.py</span> ................. entry point: daemon, --simulator, --build-wiki, --lint-wiki, --bench, --gui
 <span class="white">del_fi/</span>
   <span class="dim">config.py</span> ............. YAML loading, validation, oracle profiles
+  <span class="dim">bench.py</span> .............. --bench: time answers to a list of questions
   <span class="dim">core/</span>
     <span class="white">dispatcher.py</span> ........ main loop: rate limit, question queue, worker thread
     <span class="white">knowledge.py</span> ......... WikiEngine: compile knowledge/ → wiki/, passage retrieval, lint

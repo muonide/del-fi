@@ -10,7 +10,8 @@
 
 ```
 1. Path: --config PATH, else config.yaml next to main.py, else ~/del-fi/config.yaml
-2. Parse YAML (must be a mapping); node_name is required
+2. Parse YAML (must be a mapping); node_name is required. Command-line
+   overrides (--model) replace keys as if they were in the file
 3. Warn (don't fail) about unknown top-level keys — usually typos
 4. Merge DEFAULTS; apply the oracle profile for the model (§4)
 5. Resolve paths against the config file's directory (§5)
@@ -25,7 +26,9 @@ edit is rejected without killing the server. Config is read once at startup;
 there is no live reload.
 
 The resolved path is recorded as `cfg["_config_path"]`; the GUI edits that
-file, never a guess.
+file, never a guess. `cfg["_profile"]` names the profile applied (§4) and
+`cfg["_explicit_keys"]` lists the keys set in the file, which a size
+profile never overrides.
 
 ---
 
@@ -50,6 +53,7 @@ Every key is optional except `node_name`.
 | `model` | str | `gemma4:e4b` | Serving model (answers). Selects an oracle profile (§4). |
 | `ollama_host` | str | `http://localhost:11434` | |
 | `ollama_timeout` | number | `120` | Seconds per answer before giving up ("that took too long"). |
+| `ollama_keep_alive` | number or duration | `-1` | How long Ollama keeps the model loaded after an answer: `-1` = always, `0` = unload at once, or seconds / a duration like `"30m"`. Del-Fi also loads the model at startup and after Ollama comes back, so no question waits for a cold load. |
 | `num_predict` | int ≥ 16 | `300` | Max output tokens per answer. |
 | `num_ctx` | int ≥ 512 or empty | derived | Context window. Empty = derived from `max_context_tokens` and fixed for the process (see spec-knowledge §7.2). |
 | `embedding_model` | str | `nomic-embed-text` | For optional ChromaDB semantic search. |
@@ -181,6 +185,7 @@ Violations raise `ConfigError` (exit 1 from the CLI):
 | `rate_limit_seconds`, `response_cache_ttl` negative or non-numeric | the key |
 | `auto_send_chunks` < 1, `num_predict` < 16, `num_ctx` < 512, `max_context_tokens` < 64, `memory_max_turns` < 0 | the key |
 | `query_queue_size` < 1, `ollama_timeout` ≤ 0 | the key |
+| `ollama_keep_alive` not a number or a duration like `30m` / `1h30m` | the key |
 | `log_level` unknown | valid levels |
 | `mesh_knowledge.gossip.announce_interval` < 15 min, bad `directory_ttl`, `channel` not 0–7 | the key |
 | a `mesh_knowledge.peers` entry without a `!xxxxxxxx` node ID | node IDs, not names |
@@ -200,9 +205,23 @@ Per-model defaults, applied by case-insensitive substring match on `model`
 | `gemma4:e2b`, `gemma3:1b`, `llama3.2:1b` | `similarity_threshold: 0.35`, `rag_top_k: 2`, `max_context_tokens: 512`, `small_model_prompt: true`, `reorder_context: true` |
 | `gemma4:e4b`, `gemma3:4b`, `qwen2.5:3b` | `similarity_threshold: 0.28`, `rag_top_k: 4` |
 | `gemma4:12b` | `similarity_threshold: 0.25`, `rag_top_k: 5`, `max_context_tokens: 3000` |
-| anything else | config values as-is |
+| anything else | a size profile once Ollama reports the model's size (below) |
 
 `gemma3:1b` matches `gemma3:1b-it-qat`; it does not match `gemma3:12b`.
+
+**Size profiles.** For a model no name matches (qwen3, phi, mistral, ...),
+the WikiEngine asks Ollama (`ollama show`) for its parameter count when it
+connects and applies the profile for that size, again only to keys not set
+in config.yaml:
+
+| Parameters | Profile | Same overrides as |
+|------------|---------|-------------------|
+| ≤ 2.5B | `small (by size)` | `gemma3:1b` |
+| ≤ 9B | `mid (by size)` | `gemma4:e4b` |
+| larger | `large (by size)` | `gemma4:12b` |
+
+The startup log shows the result, e.g. `model qwen3:1.7b: 2.0B, thinking off
+· profile small (by size) · context 512 tok, num_ctx 2560, num_predict 300`.
 
 ---
 

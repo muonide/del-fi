@@ -4,6 +4,7 @@ Usage:
   python main.py [--config PATH] [--simulator]
   python main.py --build-wiki [--config PATH]
   python main.py --lint-wiki  [--config PATH]
+  python main.py --bench [QUESTIONS_FILE] [--model NAME]
 """
 
 import argparse
@@ -116,10 +117,13 @@ def print_banner(cfg: dict, wiki: WikiEngine, mesh_iface, gossip_dir: GossipDire
 
 
 def ollama_health_check(wiki: WikiEngine, stop: threading.Event):
-    while not stop.is_set():
-        if not wiki.available:
-            wiki.check_ollama()
-        stop.wait(30)
+    """Load the model at startup, and again whenever Ollama comes back, so
+    questions don't wait for it to load."""
+    if wiki.available:
+        wiki.warm_up()
+    while not stop.wait(30):
+        if not wiki.available and wiki.check_ollama():
+            wiki.warm_up()
 
 
 def maintenance_worker(router: Router, stop: threading.Event):
@@ -142,6 +146,10 @@ def run_build_wiki(cfg: dict):
     wiki = WikiEngine(cfg)
     if not wiki.available:
         print("ERROR: Ollama is not available. Start Ollama and try again.")
+        sys.exit(1)
+    builder = cfg.get("wiki_builder_model") or cfg["model"]
+    if not wiki.has_model(builder):
+        print(f"ERROR: model {builder!r} is not pulled. Run: ollama pull {builder}")
         sys.exit(1)
     print(f"Building wiki from {cfg['knowledge_folder']} ...")
     count = wiki.build()
@@ -299,6 +307,19 @@ def main():
         help="Check wiki health and exit",
     )
     parser.add_argument(
+        "--bench",
+        nargs="?",
+        const="",
+        metavar="QUESTIONS_FILE",
+        help="Time answers to the questions in a file (one per line; default: "
+             "one per wiki topic) and exit",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="NAME",
+        help="Use this Ollama model instead of the one in config.yaml",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Open the web-based configuration and management GUI",
@@ -317,7 +338,16 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, {"model": args.model} if args.model else None)
+
+    if args.bench is not None:
+        # The bench prints its own report; only warnings go to the log.
+        setup_logging(cfg["log_level"])
+        if cfg["log_level"] != "debug":
+            logging.getLogger("del_fi").setLevel(logging.WARNING)
+        from del_fi.bench import run as run_bench
+        sys.exit(run_bench(cfg, args.bench))
+
     setup_logging(cfg["log_level"], default_log_file(cfg, args.simulator),
                   simulator=args.simulator)
     log.info(f"del-fi v{VERSION} starting")

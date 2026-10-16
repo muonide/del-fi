@@ -1,0 +1,14 @@
+# Questions for timing answers on your hardware, one per line:
+#   python main.py --bench bench-questions.txt
+#   python main.py --bench bench-questions.txt --model gemma3:1b
+# Lines starting with # are skipped.
+I heard a bird that goes fee-bee
+something is making a long eerie whistle in the cedars
+what owl hoots who cooks for you?
+big black woodpecker with a red crest, what is it?
+how do I tell a Downy from a Hairy Woodpecker?
+where's the best place to see herons?
+can I bring my dog?
+I found a baby bird on the ground, what should I do?
+when do the swallows come back?
+how accurate is the listening station?

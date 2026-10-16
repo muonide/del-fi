@@ -180,7 +180,7 @@ class TestRetry(unittest.TestCase):
         router.last_query["!a"] = "where is camp"
         d, sent, clock, _ = make_dispatcher(router)
         d.handle("!a", "!retry")
-        self.assertEqual(d.query_queue.get_nowait(), ("!a", "where is camp"))
+        self.assertEqual(d.query_queue.get_nowait(), ("!a", "where is camp", clock.now))
         d.handle("!a", "!retry")
         self.assertIn("One question per", texts_to(sent, "!a")[0])
 
@@ -202,6 +202,28 @@ class TestWorker(unittest.TestCase):
             d.stop()
         self.assertEqual(texts_to(sent, "!a"), ["answer: where is camp", "part 2"])
         self.assertEqual(sleeps, [0.5])
+
+    def test_worker_logs_answer_time_and_queue_wait(self):
+        d, sent, clock, _ = make_dispatcher()
+        answer = d.router.route_multi
+
+        def slow_answer(sender, text):
+            clock.now += 42.0
+            return answer(sender, text)
+
+        d.router.route_multi = slow_answer
+        d.handle("!a", "where is camp")
+        clock.now += 3.0  # the worker picks it up 3 s after it was queued
+        with self.assertLogs("del_fi.core.dispatcher", "INFO") as logs:
+            d.start()
+            try:
+                d.query_queue.join()
+            finally:
+                d.stop()
+        self.assertTrue(
+            any("2 msg(s)" in m and "answered in 42.0s, queued 3.0s" in m for m in logs.output),
+            logs.output,
+        )
 
     def test_worker_error_replies_and_releases_sender(self):
         router = FakeRouter()

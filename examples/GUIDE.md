@@ -330,9 +330,14 @@ python main.py --build-wiki
 # 3. Check wiki health
 python main.py --lint-wiki
 
-# 4. Start the daemon
+# 4. Time a few typical questions on the node's hardware (one per line)
+python main.py --bench questions.txt
+
+# 5. Start the daemon
 python main.py
 ```
+
+`--bench` prints each answer with how long it took, so you can check both the answers and whether they come fast enough; add `--model NAME` to try another model without editing the config.
 
 For `--build-wiki`, set `wiki_builder_model` in config to a larger model even if the serving model is smaller:
 

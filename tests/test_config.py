@@ -313,6 +313,46 @@ class TestOracleProfiles(unittest.TestCase):
         self.assertIsNone(_match_profile("gemma4:26b"))
 
 
+class TestModelSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="delfi-cfgtest-")
+
+    def _read(self, text, overrides=None):
+        from del_fi.config import read_config
+        return read_config(_write_config(self.tmpdir, text), overrides)
+
+    def test_model_override_gets_its_own_profile(self):
+        cfg = self._read('node_name: "T"\nmodel: "gemma4:e4b"\n', {"model": "gemma3:1b"})
+        self.assertEqual(cfg["model"], "gemma3:1b")
+        self.assertEqual(cfg["_profile"], "gemma3:1b")
+        self.assertEqual(cfg["max_context_tokens"], 512)
+        self.assertIn("model", cfg["_explicit_keys"])
+
+    def test_unknown_model_waits_for_a_size_profile(self):
+        cfg = self._read('node_name: "T"\nmodel: "qwen3:4b"\nrag_top_k: 3\n')
+        self.assertEqual(cfg["_profile"], "")
+        self.assertEqual(cfg["_explicit_keys"], ["model", "node_name", "rag_top_k"])
+
+    def test_size_profiles(self):
+        from del_fi.config import size_profile
+        self.assertEqual(size_profile(0.75)[0], "small")
+        self.assertEqual(size_profile(2.0)[1]["max_context_tokens"], 512)
+        self.assertEqual(size_profile(4.0)[0], "mid")
+        self.assertEqual(size_profile(8.2)[0], "mid")
+        self.assertEqual(size_profile(14.8)[0], "large")
+
+    def test_keep_alive_values(self):
+        from del_fi.config import ConfigError
+        self.assertEqual(self._read('node_name: "T"\n')["ollama_keep_alive"], -1)
+        for good in ("-1", "30m", "1h30m", "300", "0"):
+            cfg = self._read(f'node_name: "T"\nollama_keep_alive: "{good}"\n')
+            self.assertEqual(cfg["ollama_keep_alive"], good)
+        self.assertEqual(self._read('node_name: "T"\nollama_keep_alive: 600\n')["ollama_keep_alive"], 600)
+        for bad in ('"forever"', "yes", '""'):
+            with self.assertRaises(ConfigError, msg=bad):
+                self._read(f'node_name: "T"\nollama_keep_alive: {bad}\n')
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -16,6 +16,7 @@ model: "gemma4:e4b"   # Raspberry Pi: start with gemma3:1b or llama3.2:1b
 # wiki_builder_model: "gemma4:12b"   # bigger model for --build-wiki (falls back to model)
 # ollama_host: "http://localhost:11434"
 # ollama_timeout: 120                # seconds per answer
+# ollama_keep_alive: -1              # keep the model loaded (-1), or unload after e.g. "30m" idle
 # num_predict: 300                   # max output tokens
 # num_ctx:                           # empty = derived from max_context_tokens
 # embedding_model: "nomic-embed-text"  # optional semantic search (needs chromadb)
